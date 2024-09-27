@@ -1,0 +1,18 @@
+# Exclude lockfiles while unstable
+*.lock
+
+# python generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+# Rust
+target/
+
+# Rust link files
+python/rux_2024/*.cpython*
+
+# venv
+.venv

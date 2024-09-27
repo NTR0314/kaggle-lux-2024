@@ -1,0 +1,29 @@
+[project]
+name = "rux-2024"
+version = "0.1.0"
+description = "Add your description here"
+authors = [
+    { name = "IsaiahPressman" }
+]
+dependencies = [
+    "ruff>=0.6.8",
+    "mypy>=1.11.2",
+    "pytest>=8.3.3",
+    "numpy>=2.1.1",
+    "pip>=24.2",
+]
+readme = "README.md"
+requires-python = ">= 3.8"
+
+[build-system]
+requires = ["maturin>=1.2,<2.0"]
+build-backend = "maturin"
+
+[tool.rye]
+managed = true
+dev-dependencies = []
+
+[tool.maturin]
+python-source = "python"
+module-name = "rux_2024._lowlevel"
+features = ["pyo3/extension-module"]
