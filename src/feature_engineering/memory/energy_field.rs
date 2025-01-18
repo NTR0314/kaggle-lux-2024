@@ -1,5 +1,6 @@
 use crate::feature_engineering::memory::cached_energy_fields::CACHED_ENERGY_FIELDS;
 use crate::feature_engineering::memory::masked_possibilities::MaskedPossibilities;
+use crate::feature_engineering::utils::memory_error;
 use crate::rules_engine::param_ranges::{
     ParamRanges, IRRELEVANT_ENERGY_NODE_DRIFT_SPEED,
 };
@@ -96,14 +97,16 @@ impl EnergyFieldMemory {
             }
             candidate_cached_field = Some(cached_field);
         }
-        let Some(cached_field) = candidate_cached_field else {
-            // TODO: For game-time build, don't panic
-            panic!("No matching energy field found in CACHED_ENERGY_FIELDS")
+        if let Some(cached_field) = candidate_cached_field {
+            Zip::from(&mut self.energy_field)
+                .and(cached_field)
+                .for_each(|e, &cached_e| *e = Some(cached_e));
+            self.full_energy_field_cached = true;
+        } else {
+            memory_error(
+                "No matching energy field found in CACHED_ENERGY_FIELDS",
+            )
         };
-        Zip::from(&mut self.energy_field)
-            .and(cached_field)
-            .for_each(|e, &cached_e| *e = Some(cached_e));
-        self.full_energy_field_cached = true;
     }
 }
 

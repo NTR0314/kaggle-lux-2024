@@ -22,6 +22,11 @@ where
     encoded
 }
 
+pub fn memory_error(msg: &str) {
+    // TODO: For game-time build, don't panic
+    panic!("{}", msg);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +53,11 @@ mod tests {
     fn test_one_hot_encode_param_range_panics() {
         let range = vec![1, 2, 3];
         one_hot_bool_encode_param_range(0, &range);
+    }
+
+    #[test]
+    #[should_panic(expected = "ERROR")]
+    fn test_memory_error() {
+        memory_error("ERROR");
     }
 }

@@ -1,4 +1,5 @@
 use crate::feature_engineering::memory::masked_possibilities::MaskedPossibilities;
+use crate::feature_engineering::utils::memory_error;
 use crate::rules_engine::action::Action;
 use crate::rules_engine::action::Action::{Down, Left, NoOp, Right, Sap, Up};
 use crate::rules_engine::env::{
@@ -161,12 +162,14 @@ impl LastObservationData {
 }
 
 fn determine_nebula_tile_vision_reduction(
-    nebula_tile_vision_reduction_options: &mut MaskedPossibilities<i32>,
+    nebula_tile_vision_reduction: &mut MaskedPossibilities<i32>,
     obs: &Observation,
     map_size: [usize; 2],
     unit_sensor_range: usize,
     nebulae_could_have_moved: bool,
 ) {
+    let nebula_tile_vision_reduction_backup_mask =
+        nebula_tile_vision_reduction.mask.clone();
     let expected_vision_power_map = estimate_vision_power_map(
         obs.get_my_units(),
         map_size,
@@ -178,7 +181,7 @@ fn determine_nebula_tile_vision_reduction(
             .iter()
             .map(|n| expected_vision_power_map[n.as_index()])
         {
-            nebula_tile_vision_reduction_options
+            nebula_tile_vision_reduction
                 .iter_unmasked_options_mut_mask()
                 .for_each(|(vision_reduction, mask)| {
                     if *vision_reduction >= expected_vision {
@@ -192,7 +195,7 @@ fn determine_nebula_tile_vision_reduction(
         .and(&obs.sensor_mask)
         .for_each(|expected_vision, can_see| {
             if *expected_vision > 0 && !can_see {
-                nebula_tile_vision_reduction_options
+                nebula_tile_vision_reduction
                     .iter_unmasked_options_mut_mask()
                     .for_each(|(vision_reduction, mask)| {
                         if vision_reduction < expected_vision {
@@ -202,9 +205,10 @@ fn determine_nebula_tile_vision_reduction(
             }
         });
 
-    if nebula_tile_vision_reduction_options.all_masked() {
-        // TODO: For game-time build, don't panic and instead just fail to update mask
-        panic!("nebula_tile_vision_reduction mask is all false")
+    if nebula_tile_vision_reduction.all_masked() {
+        memory_error("nebula_tile_vision_reduction mask is all false");
+        nebula_tile_vision_reduction.mask =
+            nebula_tile_vision_reduction_backup_mask;
     }
 }
 
@@ -366,6 +370,8 @@ fn determine_unit_sap_dropoff_factor(
     fixed_params: &FixedParams,
     params: &KnownVariableParams,
 ) {
+    let unit_sap_dropoff_factor_backup_mask =
+        unit_sap_dropoff_factor.mask.clone();
     // Note that the environment resolution order goes:
     // - Move units
     // - Resolve sap actions
@@ -453,34 +459,8 @@ fn determine_unit_sap_dropoff_factor(
     }
 
     if unit_sap_dropoff_factor.all_masked() {
-        let unit_energy_field = obs
-            .get_opp_units()
-            .iter()
-            .map(|u| obs.energy_field[u.pos.as_index()])
-            .collect_vec();
-        // TODO: For game-time build, don't panic and instead just fail to update mask
-        panic!(
-            "unit_sap_dropoff_factor mask is all false.
-            My units last turn: {:?}
-            My units now: {:?}
-            Opp units last turn: {:?}
-            Opp units now: {:?}
-            Move cost / sap cost: {:?} / {:?}
-            Nebulae: {:?}
-            Energy field: {:?}
-            Direct saps: {:?}
-            Adjacent saps: {:?}",
-            last_obs_data.my_units,
-            obs.get_my_units(),
-            last_obs_data.opp_units,
-            obs.get_opp_units(),
-            params.unit_move_cost,
-            params.unit_sap_cost,
-            last_obs_data.nebulae,
-            unit_energy_field,
-            sap_count_map,
-            adjacent_sap_count_map,
-        );
+        memory_error("unit_sap_dropoff_factor mask is all false");
+        unit_sap_dropoff_factor.mask = unit_sap_dropoff_factor_backup_mask;
     }
 }
 
@@ -542,6 +522,8 @@ fn determine_unit_energy_void_factor(
     fixed_params: &FixedParams,
     params: &KnownVariableParams,
 ) {
+    let unit_energy_void_factor_backup_mask =
+        unit_energy_void_factor.mask.clone();
     // Note that the environment resolution order goes:
     // - Move units
     // - Resolve sap actions
@@ -638,8 +620,8 @@ fn determine_unit_energy_void_factor(
     }
 
     if unit_energy_void_factor.all_masked() {
-        // TODO: For game-time build, don't panic and instead just fail to update mask
-        panic!("unit_energy_void_factor mask is all false")
+        memory_error("unit_energy_void_factor mask is all false");
+        unit_energy_void_factor.mask = unit_energy_void_factor_backup_mask;
     }
 }
 

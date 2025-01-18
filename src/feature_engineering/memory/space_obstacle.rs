@@ -1,4 +1,5 @@
 use crate::feature_engineering::memory::masked_possibilities::MaskedPossibilities;
+use crate::feature_engineering::utils::memory_error;
 use crate::rules_engine::env::estimate_vision_power_map;
 use crate::rules_engine::param_ranges::ParamRanges;
 use crate::rules_engine::params::KnownVariableParams;
@@ -276,6 +277,8 @@ fn update_nebula_tile_drift_speed(
     positive_drift_impossible: bool,
     step: u32,
 ) {
+    let nebula_tile_drift_speed_backup_mask =
+        nebula_tile_drift_speed.mask.clone();
     // not_drifting_impossible => objects have definitely drifted
     if not_drifting_impossible {
         nebula_tile_drift_speed
@@ -308,8 +311,8 @@ fn update_nebula_tile_drift_speed(
     }
 
     if nebula_tile_drift_speed.all_masked() {
-        // TODO: For game-time build, don't panic and instead just fail to update mask
-        panic!("nebula_tile_drift_speed mask is all false")
+        memory_error("nebula_tile_drift_speed mask is all false");
+        nebula_tile_drift_speed.mask = nebula_tile_drift_speed_backup_mask;
     }
 }
 
