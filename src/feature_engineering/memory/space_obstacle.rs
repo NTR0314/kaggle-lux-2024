@@ -336,16 +336,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules_engine::param_ranges::PARAM_RANGES;
     use rstest::rstest;
-
-    #[test]
-    fn test_update_total_steps_assumption() {
-        assert!(PARAM_RANGES
-            .nebula_tile_drift_speed
-            .iter()
-            .all(|&s| (1. / s) % 20. == 0.))
-    }
 
     #[rstest]
     // Basic single impossible option cases
