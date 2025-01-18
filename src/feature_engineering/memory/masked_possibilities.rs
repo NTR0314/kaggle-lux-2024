@@ -6,13 +6,7 @@ pub struct MaskedPossibilities<T> {
     pub mask: Vec<bool>,
 }
 
-#[allow(dead_code)]
 impl<T> MaskedPossibilities<T> {
-    pub fn new(options: Vec<T>, mask: Vec<bool>) -> Self {
-        assert_eq!(options.len(), mask.len());
-        Self { options, mask }
-    }
-
     pub fn from_options(options: Vec<T>) -> Self {
         let mask = vec![true; options.len()];
         Self { options, mask }
@@ -29,12 +23,10 @@ impl<T> MaskedPossibilities<T> {
             .collect()
     }
 
-    #[inline]
     pub fn still_unsolved(&self) -> bool {
         self.mask.iter().filter(|mask| **mask).count() > 1
     }
 
-    #[inline]
     pub fn iter_unmasked_options_mut_mask(
         &mut self,
     ) -> impl Iterator<Item = (&T, &mut bool)> {
@@ -44,12 +36,21 @@ impl<T> MaskedPossibilities<T> {
             .filter(|(_, mask)| **mask)
     }
 
-    #[inline]
     pub fn iter_unmasked_options(&self) -> impl Iterator<Item = &T> {
         self.options
             .iter()
             .zip_eq(self.mask.iter())
             .filter_map(|(opt, mask)| mask.then_some(opt))
+    }
+
+    pub fn get_solution(&self) -> Option<&T> {
+        let mut unmasked_options_iter = self.iter_unmasked_options();
+        let solution = unmasked_options_iter.next().unwrap();
+        if unmasked_options_iter.next().is_some() {
+            None
+        } else {
+            Some(solution)
+        }
     }
 
     pub fn all_masked(&self) -> bool {
@@ -59,9 +60,21 @@ impl<T> MaskedPossibilities<T> {
     pub fn get_options(&self) -> &[T] {
         &self.options
     }
+}
+
+#[cfg(test)]
+impl<T> MaskedPossibilities<T> {
+    pub fn new(options: Vec<T>, mask: Vec<bool>) -> Self {
+        assert_eq!(options.len(), mask.len());
+        Self { options, mask }
+    }
 
     pub fn get_mask(&self) -> &[bool] {
         &self.mask
+    }
+
+    pub fn solved(&self) -> bool {
+        !self.still_unsolved()
     }
 }
 

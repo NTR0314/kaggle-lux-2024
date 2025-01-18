@@ -347,7 +347,7 @@ fn resolve_collisions_and_energy_void_fields(
             }
             // Apply energy void fields
             let void_field_loss = (params.unit_energy_void_factor
-                * unit_aggregate_energy_void_map[[opp, x, y]]
+                * unit_aggregate_energy_void_map[[opp, x, y]] as f32
                 / unit_counts_map[[team, x, y]] as f32)
                 as i32;
             unit.energy -= void_field_loss;
@@ -366,7 +366,7 @@ fn get_unit_aggregate_energy_void_map(
     units: &[Vec<Unit>; P],
     unit_energies: &[Vec<i32>; P],
     map_size: [usize; 2],
-) -> Array3<f32> {
+) -> Array3<i32> {
     let mut result = Array3::zeros((P, map_size[0], map_size[1]));
     for ((team, unit, energy), delta) in units
         .iter()
@@ -384,7 +384,7 @@ fn get_unit_aggregate_energy_void_map(
         else {
             continue;
         };
-        result[[team, x, y]] += energy as f32;
+        result[[team, x, y]] += energy;
     }
     result
 }
@@ -545,17 +545,20 @@ fn spawn_units(units: &mut [Vec<Unit>; P], fixed_params: &FixedParams) {
                 .unwrap()
         };
 
-        let pos = match team {
-            0 => Pos::new(0, 0),
-            1 => Pos::new(
-                fixed_params.map_width - 1,
-                fixed_params.map_height - 1,
-            ),
-            n => panic!("this town ain't big enough for the {n} of us"),
-        };
-
+        let pos = get_spawn_position(team, fixed_params.map_size);
         let new_unit = Unit::new(pos, fixed_params.init_unit_energy, u_id);
         team_units.insert(u_id, new_unit);
+    }
+}
+
+pub fn get_spawn_position(
+    team_id: usize,
+    [map_width, map_height]: [usize; 2],
+) -> Pos {
+    match team_id {
+        0 => Pos::new(0, 0),
+        1 => Pos::new(map_width - 1, map_height - 1),
+        _ => unreachable!(),
     }
 }
 
@@ -564,12 +567,8 @@ pub fn just_respawned(
     team_id: usize,
     fixed_params: &FixedParams,
 ) -> bool {
-    let pos = match team_id {
-        0 => Pos::new(0, 0),
-        1 => Pos::new(fixed_params.map_width - 1, fixed_params.map_height - 1),
-        _ => unreachable!(),
-    };
-    unit.energy == fixed_params.init_unit_energy && unit.pos == pos
+    let spawn_pos = get_spawn_position(team_id, fixed_params.map_size);
+    unit.energy == fixed_params.init_unit_energy && unit.pos == spawn_pos
 }
 
 pub fn estimate_vision_power_map(
@@ -798,10 +797,7 @@ fn step_game(
         },
     }
 
-    if *total_steps
-        < (fixed_params.max_steps_in_match + 1)
-            * fixed_params.match_count_per_episode
-    {
+    if *total_steps < fixed_params.get_max_steps_in_game() {
         return None;
     }
 
@@ -901,7 +897,7 @@ mod tests {
     use serde::Deserialize;
     use std::fs;
     use std::iter::once;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     #[should_panic(expected = "Game over")]
@@ -1153,8 +1149,7 @@ mod tests {
                 Unit::with_pos_and_energy(Pos::new(0, 1), 30),
             ],
         ];
-        let expected_result =
-            arr3(&[[[0., 3.], [3., 0.]], [[30., 4.], [4., 30.]]]);
+        let expected_result = arr3(&[[[0, 3], [3, 0]], [[30, 4], [4, 30]]]);
         let unit_energies = get_unit_energies(&units);
         let result =
             get_unit_aggregate_energy_void_map(&units, &unit_energies, [2, 2]);
@@ -1753,9 +1748,7 @@ mod tests {
     #[test]
     fn test_step_game() {
         let fixed_params = FIXED_PARAMS;
-        let start_step = (fixed_params.max_steps_in_match + 1)
-            * fixed_params.match_count_per_episode
-            - 2;
+        let start_step = fixed_params.get_max_steps_in_game() - 2;
         let mut total_steps = start_step;
         let mut game_over = false;
         let result = step_game(
@@ -1819,9 +1812,7 @@ mod tests {
     #[should_panic(expected = "Team wins tied")]
     fn test_step_game_panics() {
         let fixed_params = FIXED_PARAMS;
-        let mut total_steps = (fixed_params.max_steps_in_match + 1)
-            * fixed_params.match_count_per_episode
-            - 1;
+        let mut total_steps = fixed_params.get_max_steps_in_game() - 1;
         step_game(
             &mut total_steps,
             &mut false,
@@ -1987,20 +1978,11 @@ mod tests {
     }
 
     #[rstest]
-    // Two energy nodes
-    #[case("processed_replay_6155879.json")]
-    // Four energy nodes
-    #[case("processed_replay_4086850.json")]
-    // Six energy nodes
-    #[case("processed_replay_2462211601.json")]
     #[ignore = "slow"]
-    fn test_full_game(#[case] file_name: &str) {
-        let path = Path::new(file!())
-            .parent()
-            .unwrap()
-            .join("test_data")
-            .join("processed_replays")
-            .join(file_name);
+    fn test_full_game(
+        #[files("src/rules_engine/test_data/processed_replays/*.json")]
+        path: PathBuf,
+    ) {
         let json_data = fs::read_to_string(path).unwrap();
         let full_replay: FullReplay = serde_json::from_str(&json_data).unwrap();
         let all_states = full_replay.get_states();

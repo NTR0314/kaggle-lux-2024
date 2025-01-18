@@ -4,6 +4,7 @@ use crate::feature_engineering::memory::Memory;
 use crate::feature_engineering::obs_space::basic_obs_space::write_obs_arrays;
 use crate::feature_engineering::unit_features::write_unit_features;
 use crate::rules_engine::action::Action;
+use crate::rules_engine::param_ranges::PARAM_RANGES;
 use crate::rules_engine::params::{KnownVariableParams, FIXED_PARAMS, P};
 use crate::rules_engine::state::Observation;
 use itertools::Itertools;
@@ -46,15 +47,17 @@ pub fn update_memories_and_write_output_arrays(
             mem.update(obs, last_actions, &FIXED_PARAMS, params)
         });
     write_obs_arrays(
-        obs_slice.spatial_obs.view_mut(),
-        obs_slice.global_obs.view_mut(),
+        obs_slice.temporal_spatial_obs.view_mut(),
+        obs_slice.nontemporal_spatial_obs.view_mut(),
+        obs_slice.temporal_global_obs.view_mut(),
+        obs_slice.nontemporal_global_obs.view_mut(),
         observations,
         memories,
         params,
     );
     let known_valuable_points_maps = memories
         .iter()
-        .map(|m| m.get_known_valuable_relic_points_map())
+        .map(|m| m.get_relic_known_and_explored_points_map().view())
         .collect_vec();
     write_basic_action_space(
         action_info_slice.action_mask.view_mut(),
@@ -62,6 +65,7 @@ pub fn update_memories_and_write_output_arrays(
         observations,
         &known_valuable_points_maps,
         params,
+        &PARAM_RANGES,
     );
     write_unit_features(
         action_info_slice.unit_indices.view_mut(),

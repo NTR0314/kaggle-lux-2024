@@ -4,10 +4,13 @@ use crate::env_api::env_data::{
 use crate::env_api::utils::{
     player_action_array_to_vec, update_memories_and_write_output_arrays,
 };
+use crate::feature_engineering::action_space::get_main_action_count;
 use crate::feature_engineering::obs_space::basic_obs_space::{
-    get_global_feature_count, get_spatial_feature_count,
+    get_nontemporal_global_feature_count,
+    get_nontemporal_spatial_feature_count, get_temporal_global_feature_count,
+    get_temporal_spatial_feature_count,
 };
-use crate::rules_engine::action::Action;
+use crate::rules_engine::param_ranges::PARAM_RANGES;
 use crate::rules_engine::params::{KnownVariableParams, FIXED_PARAMS};
 use crate::rules_engine::state::LuxPlayerObservation;
 use numpy::ndarray::{Array2, Array3, Array4};
@@ -15,10 +18,14 @@ use numpy::{IntoPyArray, PyArray2, PyArray3, PyArray4, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::Bound;
-use strum::EnumCount;
 
 type PyEnvOutputs<'py> = (
-    (Bound<'py, PyArray4<f32>>, Bound<'py, PyArray2<f32>>),
+    (
+        Bound<'py, PyArray4<f32>>,
+        Bound<'py, PyArray4<f32>>,
+        Bound<'py, PyArray2<f32>>,
+        Bound<'py, PyArray2<f32>>,
+    ),
     (
         Bound<'py, PyArray3<bool>>,
         Bound<'py, PyArray4<bool>>,
@@ -76,8 +83,10 @@ impl FeatureEngineeringEnv {
         let last_actions = player_action_array_to_vec(last_actions.as_array());
         let mut out = EnvOutputs::new();
         let obs_view = ObsArraysView {
-            spatial_obs: out.spatial_obs.view_mut(),
-            global_obs: out.global_obs.view_mut(),
+            temporal_spatial_obs: out.temporal_spatial_obs.view_mut(),
+            nontemporal_spatial_obs: out.nontemporal_spatial_obs.view_mut(),
+            temporal_global_obs: out.temporal_global_obs.view_mut(),
+            nontemporal_global_obs: out.nontemporal_global_obs.view_mut(),
         };
         let action_info_view = ActionInfoArraysView {
             action_mask: out.action_mask.view_mut(),
@@ -99,8 +108,10 @@ impl FeatureEngineeringEnv {
 }
 
 struct EnvOutputs {
-    spatial_obs: Array4<f32>,
-    global_obs: Array2<f32>,
+    temporal_spatial_obs: Array4<f32>,
+    nontemporal_spatial_obs: Array4<f32>,
+    temporal_global_obs: Array2<f32>,
+    nontemporal_global_obs: Array2<f32>,
     action_mask: Array3<bool>,
     sap_mask: Array4<bool>,
     unit_indices: Array3<isize>,
@@ -110,15 +121,27 @@ struct EnvOutputs {
 
 impl EnvOutputs {
     fn new() -> Self {
-        let spatial_obs = Array4::zeros((
+        let temporal_spatial_obs = Array4::zeros((
             1,
-            get_spatial_feature_count(),
+            get_temporal_spatial_feature_count(),
             FIXED_PARAMS.map_width,
             FIXED_PARAMS.map_height,
         ));
-        let global_obs = Array2::zeros((1, get_global_feature_count()));
-        let action_mask =
-            Array3::default((1, FIXED_PARAMS.max_units, Action::COUNT));
+        let nontemporal_spatial_obs = Array4::zeros((
+            1,
+            get_nontemporal_spatial_feature_count(),
+            FIXED_PARAMS.map_width,
+            FIXED_PARAMS.map_height,
+        ));
+        let temporal_global_obs =
+            Array2::zeros((1, get_temporal_global_feature_count()));
+        let nontemporal_global_obs =
+            Array2::zeros((1, get_nontemporal_global_feature_count()));
+        let action_mask = Array3::default((
+            1,
+            FIXED_PARAMS.max_units,
+            get_main_action_count(&PARAM_RANGES),
+        ));
         let sap_mask = Array4::default((
             1,
             FIXED_PARAMS.max_units,
@@ -129,8 +152,10 @@ impl EnvOutputs {
         let unit_energies = Array2::zeros((1, FIXED_PARAMS.max_units));
         let units_mask = Array2::default((1, FIXED_PARAMS.max_units));
         Self {
-            spatial_obs,
-            global_obs,
+            temporal_spatial_obs,
+            nontemporal_spatial_obs,
+            temporal_global_obs,
+            nontemporal_global_obs,
             action_mask,
             sap_mask,
             unit_indices,
@@ -141,8 +166,10 @@ impl EnvOutputs {
 
     fn into_pyarray_bound(self, py: Python) -> PyEnvOutputs {
         let obs = (
-            self.spatial_obs.into_pyarray_bound(py),
-            self.global_obs.into_pyarray_bound(py),
+            self.temporal_spatial_obs.into_pyarray_bound(py),
+            self.nontemporal_spatial_obs.into_pyarray_bound(py),
+            self.temporal_global_obs.into_pyarray_bound(py),
+            self.nontemporal_global_obs.into_pyarray_bound(py),
         );
         let action_info = (
             self.action_mask.into_pyarray_bound(py),

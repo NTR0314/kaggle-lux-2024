@@ -1,3 +1,4 @@
+mod cached_energy_fields;
 mod energy_field;
 mod hidden_parameter;
 mod masked_possibilities;
@@ -6,15 +7,15 @@ pub mod probabilities;
 mod relic_node;
 mod space_obstacle;
 
-use crate::feature_engineering::memory::space_obstacle::SpaceObstacleMemory;
 use crate::rules_engine::action::Action;
 use crate::rules_engine::param_ranges::ParamRanges;
 use crate::rules_engine::params::{FixedParams, KnownVariableParams};
 use crate::rules_engine::state::{Observation, Pos};
 use energy_field::EnergyFieldMemory;
 use hidden_parameter::HiddenParameterMemory;
-use numpy::ndarray::{Array2, Zip};
+use numpy::ndarray::Array2;
 use relic_node::RelicNodeMemory;
+use space_obstacle::SpaceObstacleMemory;
 
 pub struct Memory {
     energy_field: EnergyFieldMemory,
@@ -81,6 +82,22 @@ impl Memory {
             .get_weighted_possibilities()
     }
 
+    pub fn iter_unmasked_nebula_tile_vision_reduction_options(
+        &self,
+    ) -> impl Iterator<Item = &i32> {
+        self.hidden_parameter
+            .nebula_tile_vision_reduction
+            .iter_unmasked_options()
+    }
+
+    pub fn iter_unmasked_nebula_tile_energy_reduction_options(
+        &self,
+    ) -> impl Iterator<Item = &i32> {
+        self.hidden_parameter
+            .nebula_tile_energy_reduction
+            .iter_unmasked_options()
+    }
+
     pub fn get_unit_sap_dropoff_factor_weights(&self) -> Vec<f32> {
         self.hidden_parameter
             .unit_sap_dropoff_factor
@@ -95,18 +112,16 @@ impl Memory {
         &self.relic_node.explored_nodes_map
     }
 
-    pub fn get_relic_points_map(&self) -> &Array2<f32> {
-        &self.relic_node.points_map
+    pub fn get_relic_known_and_explored_points_map(&self) -> &Array2<bool> {
+        &self.relic_node.known_and_explored_points_map
     }
 
-    pub fn get_known_relic_points_map(&self) -> &Array2<bool> {
-        &self.relic_node.known_points_map
+    pub fn get_relic_estimated_points_map(&self) -> &Array2<f32> {
+        &self.relic_node.estimated_unexplored_points_map
     }
 
-    pub fn get_known_valuable_relic_points_map(&self) -> Array2<bool> {
-        Zip::from(&self.relic_node.points_map)
-            .and(&self.relic_node.known_points_map)
-            .map_collect(|&value, &known| known && value >= 0.99)
+    pub fn get_relic_explored_points_map(&self) -> &Array2<bool> {
+        &self.relic_node.explored_points_map
     }
 
     pub fn get_known_asteroids_map(&self) -> &Array2<bool> {
@@ -131,59 +146,14 @@ impl Memory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature_engineering::replay::{load_replay, run_replay};
     use crate::izip_eq;
-    use crate::rules_engine::env::step;
-    use crate::rules_engine::env::TerminationMode::FinalStep;
     use crate::rules_engine::param_ranges::PARAM_RANGES;
-    use crate::rules_engine::params::FIXED_PARAMS;
-    use crate::rules_engine::replay::FullReplay;
-    use crate::rules_engine::state::State;
+    use crate::rules_engine::params::{FIXED_PARAMS, P};
     use itertools::Itertools;
-    use numpy::ndarray::ArrayView2;
+    use numpy::ndarray::{ArrayView2, Zip};
     use rstest::rstest;
-    use rstest_reuse::{self, *};
-    use std::fs;
-    use std::path::Path;
-
-    fn load_replay(file_name: &str) -> FullReplay {
-        let path = Path::new(file!())
-            .parent()
-            .unwrap()
-            .join("test_data")
-            .join(file_name);
-        let json_data = fs::read_to_string(path).unwrap();
-        let full_replay: FullReplay = serde_json::from_str(&json_data).unwrap();
-        assert_eq!(full_replay.params.fixed, FIXED_PARAMS);
-        full_replay
-    }
-
-    fn run_replay(
-        full_replay: &FullReplay,
-    ) -> impl Iterator<Item = (State, [Vec<Action>; 2], [Observation; 2], State)>
-           + use<'_> {
-        let mut rng = rand::thread_rng();
-        full_replay
-            .get_states()
-            .into_iter()
-            .tuple_windows()
-            .zip_eq(full_replay.get_actions())
-            .map(move |((state, next_state), actions)| {
-                let energy_node_deltas =
-                    state.get_energy_node_deltas(&next_state);
-                let (obs, _, _) = step(
-                    &mut state.clone(),
-                    &mut rng,
-                    &actions,
-                    &full_replay.params.variable,
-                    FinalStep,
-                    Some(
-                        energy_node_deltas[0..energy_node_deltas.len() / 2]
-                            .to_vec(),
-                    ),
-                );
-                (state, actions, obs, next_state)
-            })
-    }
+    use std::path::PathBuf;
 
     fn is_symmetrical<T>(arr: ArrayView2<T>) -> bool
     where
@@ -199,16 +169,21 @@ mod tests {
         true
     }
 
-    #[template]
-    #[rstest]
-    // TODO: Figure out a better way to make these tests
-    #[case("processed_replay_0.json")]
-    #[ignore = "slow"]
-    fn memory_replay_files(#[case] file_name: &str) {}
+    fn should_drift(step: u32, speed: f32) -> bool {
+        step as f32 * speed % 1.0 == 0.0
+    }
 
-    #[apply(memory_replay_files)]
-    fn test_energy_field_memory(#[case] file_name: &str) {
-        let full_replay = load_replay(file_name);
+    fn drift_speed_equal(speed: f32, other: f32) -> bool {
+        (0..FIXED_PARAMS.get_max_steps_in_game())
+            .all(|step| should_drift(step, speed) == should_drift(step, other))
+    }
+
+    #[rstest]
+    #[ignore = "slow"]
+    fn test_energy_field_memory(
+        #[files("src/feature_engineering/test_data/*.json")] path: PathBuf,
+    ) {
+        let full_replay = load_replay(path);
         let variable_params = &full_replay.params.variable;
         let known_params = KnownVariableParams::from(variable_params.clone());
 
@@ -217,6 +192,8 @@ mod tests {
             Memory::new(&PARAM_RANGES, FIXED_PARAMS.map_size),
         ];
         let mut known_pcts = Vec::new();
+        let mut incorrect_speed_count = 0.;
+        let mut uncached_count = 0;
         for (state, actions, obs, _next_state) in run_replay(&full_replay) {
             let mut known_count = 0;
             let mut unknown_count = 0;
@@ -224,67 +201,71 @@ mod tests {
                 izip_eq!(memories.iter_mut(), obs, actions)
             {
                 mem.update(&obs, &last_actions, &FIXED_PARAMS, &known_params);
-                for (e_mem, e_actual) in mem
+                for ((loc, e_mem), e_actual) in mem
                     .energy_field
                     .energy_field
-                    .iter()
-                    .copied()
+                    .indexed_iter()
                     .zip_eq(state.energy_field.iter().copied())
                 {
-                    if let Some(e) = e_mem {
+                    if let &Some(e) = e_mem {
                         known_count += 1;
                         assert_eq!(e, e_actual);
                     } else {
                         unknown_count += 1;
+                        assert!(!obs.sensor_mask[loc]);
                     }
                 }
-                assert!(mem
+                if !mem
                     .energy_field
                     .energy_node_drift_speed
                     .iter_unmasked_options()
-                    .any(|&speed| speed
-                        == variable_params.energy_node_drift_speed));
-
+                    .any(|&speed| {
+                        drift_speed_equal(
+                            speed,
+                            variable_params.energy_node_drift_speed,
+                        )
+                    })
+                {
+                    incorrect_speed_count += 1.;
+                }
                 assert!(is_symmetrical(mem.energy_field.energy_field.view()));
+                if mem.energy_field.energy_field_uncached() {
+                    uncached_count += 1;
+                }
             }
             known_pcts.push(
                 known_count as f32 / (known_count + unknown_count) as f32,
             );
         }
+
         let mean_known_pct =
             known_pcts.iter().sum::<f32>() / known_pcts.len() as f32;
         let max_known_pct = *known_pcts
             .iter()
             .max_by(|a, b| a.partial_cmp(b).unwrap())
             .unwrap();
-        match variable_params.unit_sensor_range {
-            2 => {
-                assert!(mean_known_pct >= 0.35);
-                assert!(max_known_pct >= 0.6);
-            },
-            3 => {
-                assert!(mean_known_pct >= 0.4);
-                assert!(max_known_pct >= 0.65);
-            },
-            4 => {
-                assert!(mean_known_pct >= 0.5);
-                assert!(max_known_pct >= 0.7);
-            },
-            n => panic!("Unrecognized unit_sensor_range {}", n),
-        }
+        let uncached_pct = uncached_count as f32
+            / P as f32
+            / FIXED_PARAMS.get_max_steps_in_game() as f32;
+        assert!(mean_known_pct >= 0.99);
+        assert_eq!(max_known_pct, 1.);
+        assert!(uncached_pct <= 1. / FIXED_PARAMS.max_steps_in_match as f32);
+        assert!(
+            incorrect_speed_count
+                / (FIXED_PARAMS.get_max_steps_in_game() * P as u32) as f32
+                <= 0.1
+        );
         for mem in memories.iter() {
-            if variable_params.energy_node_drift_speed > 0.03 {
-                assert!(!mem
-                    .energy_field
-                    .energy_node_drift_speed
-                    .still_unsolved());
-            }
+            assert!(mem.energy_field.energy_node_drift_speed.solved());
         }
     }
 
-    #[apply(memory_replay_files)]
-    fn test_hidden_parameter_memory(#[case] file_name: &str) {
-        let full_replay = load_replay(file_name);
+    #[rstest]
+    #[ignore = "slow"]
+    fn test_hidden_parameter_memory(
+        #[files("src/feature_engineering/test_data/*.json")] path: PathBuf,
+    ) {
+        let full_replay = load_replay(path);
         let variable_params = &full_replay.params.variable;
         let known_params = KnownVariableParams::from(variable_params.clone());
 
@@ -314,28 +295,28 @@ mod tests {
                     .unit_sap_dropoff_factor
                     .iter_unmasked_options()
                     .any(|&sd| sd == variable_params.unit_sap_dropoff_factor));
+                assert!(mem
+                    .hidden_parameter
+                    .unit_energy_void_factor
+                    .iter_unmasked_options()
+                    .any(|&sd| sd == variable_params.unit_energy_void_factor));
             }
         }
 
         for mem in memories.iter() {
-            assert!(!mem
-                .hidden_parameter
-                .nebula_tile_vision_reduction
-                .still_unsolved());
-            assert!(!mem
-                .hidden_parameter
-                .nebula_tile_energy_reduction
-                .still_unsolved());
-            assert!(!mem
-                .hidden_parameter
-                .unit_sap_dropoff_factor
-                .still_unsolved());
+            assert!(mem.hidden_parameter.nebula_tile_vision_reduction.solved());
+            assert!(mem.hidden_parameter.nebula_tile_energy_reduction.solved());
+            assert!(mem.hidden_parameter.unit_sap_dropoff_factor.solved());
+            assert!(mem.hidden_parameter.unit_energy_void_factor.solved());
         }
     }
 
-    #[apply(memory_replay_files)]
-    fn test_relic_node_memory(#[case] file_name: &str) {
-        let full_replay = load_replay(file_name);
+    #[rstest]
+    #[ignore = "slow"]
+    fn test_relic_node_memory(
+        #[files("src/feature_engineering/test_data/*.json")] path: PathBuf,
+    ) {
+        let full_replay = load_replay(path);
         let variable_params = &full_replay.params.variable;
         let known_params = KnownVariableParams::from(variable_params.clone());
 
@@ -349,26 +330,28 @@ mod tests {
             {
                 mem.update(&obs, &last_actions, &FIXED_PARAMS, &known_params);
                 Zip::from(&state.relic_node_points_map)
-                    .and(&mem.relic_node.points_map)
-                    .and(&mem.relic_node.known_points_map)
-                    .for_each(|&actual_point, &mem_point, &mem_point_known| {
-                        if mem_point_known {
-                            assert_eq!(
-                                if actual_point { 1.0 } else { 0.0 },
-                                mem_point
-                            );
-                        }
-                    });
-
-                for explored_pos in
-                    mem.relic_node.explored_nodes_map.indexed_iter().filter_map(
-                        |(xy, explored)| explored.then_some(Pos::from(xy)),
-                    )
-                {
-                    assert_eq!(
-                        state.relic_node_locations.contains(&explored_pos),
-                        mem.relic_node.relic_nodes.contains(&explored_pos)
+                    .and(&mem.relic_node.known_and_explored_points_map)
+                    .and(&mem.relic_node.explored_points_map)
+                    .for_each(
+                        |&actual_point, &known_and_explored, &explored| {
+                            if explored {
+                                assert_eq!(known_and_explored, actual_point);
+                            }
+                        },
                     );
+
+                for (loc, &explored) in
+                    mem.relic_node.explored_nodes_map.indexed_iter()
+                {
+                    if explored {
+                        let pos = loc.into();
+                        assert_eq!(
+                            state.relic_node_locations.contains(&pos),
+                            mem.relic_node.relic_nodes.contains(&pos)
+                        );
+                    } else {
+                        assert!(!obs.sensor_mask[loc]);
+                    }
                 }
 
                 for rn in &mem.relic_node.relic_nodes {
@@ -380,8 +363,15 @@ mod tests {
                 assert!(is_symmetrical(
                     mem.relic_node.explored_nodes_map.view()
                 ));
-                assert!(is_symmetrical(mem.relic_node.points_map.view()));
-                assert!(is_symmetrical(mem.relic_node.known_points_map.view()));
+                assert!(is_symmetrical(
+                    mem.relic_node.known_and_explored_points_map.view()
+                ));
+                assert!(is_symmetrical(
+                    mem.relic_node.estimated_unexplored_points_map.view()
+                ));
+                assert!(is_symmetrical(
+                    mem.relic_node.explored_points_map.view()
+                ));
             }
         }
         for mem in memories.iter() {
@@ -392,27 +382,38 @@ mod tests {
                 .mean()
                 .unwrap();
             match variable_params.unit_sensor_range {
-                2 => assert!(explored_pct >= 0.65),
-                3 => assert!(explored_pct >= 0.7),
-                4 => assert!(explored_pct >= 0.8),
+                2 => assert!(explored_pct >= 0.7),
+                3 => assert!(explored_pct >= 0.75),
+                4 => assert!(explored_pct >= 0.85),
                 n => panic!("Unrecognized unit_sensor_range {}", n),
             }
             if mem.relic_node.get_all_nodes_registered() {
                 assert_eq!(explored_pct, 1.0);
             }
 
+            let point_explored_pct = mem
+                .relic_node
+                .explored_points_map
+                .mapv(|ex| if ex { 1.0 } else { 0.0 })
+                .mean()
+                .unwrap();
             if full_replay.get_relic_nodes().len()
                 == FIXED_PARAMS.max_relic_nodes
-                && variable_params.unit_sensor_range > 2
             {
                 assert!(mem.relic_node.get_all_nodes_registered());
+                assert!(point_explored_pct >= 0.98);
+            } else {
+                assert!(point_explored_pct >= 0.7);
             }
         }
     }
 
-    #[apply(memory_replay_files)]
-    fn test_space_obstacle_memory(#[case] file_name: &str) {
-        let full_replay = load_replay(file_name);
+    #[rstest]
+    #[ignore = "slow"]
+    fn test_space_obstacle_memory(
+        #[files("src/feature_engineering/test_data/*.json")] path: PathBuf,
+    ) {
+        let full_replay = load_replay(path);
         let variable_params = &full_replay.params.variable;
         let known_params = KnownVariableParams::from(variable_params.clone());
 
@@ -469,11 +470,8 @@ mod tests {
                 .mapv(|ex| if ex { 1.0 } else { 0.0 })
                 .mean()
                 .unwrap();
-            assert!(explored_pct >= 0.9);
-            assert!(!mem
-                .space_obstacle
-                .nebula_tile_drift_speed
-                .still_unsolved());
+            assert!(explored_pct >= 0.98);
+            assert!(mem.space_obstacle.nebula_tile_drift_speed.solved());
         }
     }
 }

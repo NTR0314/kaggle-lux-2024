@@ -1,132 +1,280 @@
 use crate::feature_engineering::memory::Memory;
-use crate::rules_engine::param_ranges::{
-    PARAM_RANGES, UNIT_SAP_COST_MAX, UNIT_SAP_COST_MIN,
-};
+use crate::feature_engineering::utils::one_hot_float_encode_param_range;
+use crate::izip_eq;
+use crate::rules_engine::env::{estimate_vision_power_map, get_spawn_position};
+use crate::rules_engine::param_ranges::PARAM_RANGES;
 use crate::rules_engine::params::{KnownVariableParams, FIXED_PARAMS};
 use crate::rules_engine::state::{Observation, Unit};
 use itertools::Itertools;
 use numpy::ndarray::{
     ArrayViewMut1, ArrayViewMut2, ArrayViewMut3, ArrayViewMut4, Zip,
 };
+use std::iter::Iterator;
+use std::sync::LazyLock;
 use strum::{EnumCount, IntoEnumIterator};
 use strum_macros::EnumIter;
 
 #[derive(Debug, Clone, Copy, EnumCount, EnumIter)]
-enum SpatialFeature {
+enum TemporalSpatialFeature {
     Visible,
+    EstimatedVisionPower,
     MyUnitCount,
     OppUnitCount,
-    // Dead units still provide vision
-    MyDeadUnitCount,
-    OppDeadUnitCount,
     MyUnitEnergy,
     OppUnitEnergy,
+}
+
+#[derive(Debug, Clone, Copy, EnumCount, EnumIter)]
+enum NontemporalSpatialFeature {
+    // Static features first
+    DistanceFromSpawn,
+    // I think these we only need to provide these unit features
+    // for the current frame
+    MyUnitCanMove,
+    OppUnitCanMove,
+    MyUnitCanSap,
+    OppUnitCanSap,
+    // Dead units still provide vision, so we include them here
+    MyDeadUnitCount,
+    OppDeadUnitCount,
     MyUnitEnergyMin,
     OppUnitEnergyMin,
     MyUnitEnergyMax,
     OppUnitEnergyMax,
+    // These features represent the state of the map
+    // They also don't seem needed for more than the current frame
     Asteroid,
     Nebula,
     TileExplored,
     RelicNode,
     RelicNodeExplored,
-    RelicNodePoints,      // Guesstimate of the points value
-    RelicNodePointsKnown, // Whether the guessed value is known to be correct
+    // 1 if known to have points, 0 otherwise
+    TileKnownPoints,
+    // The estimated points (only if unknown, 0 if known or there's no data)
+    TileEstimatedPoints,
+    // Whether the tile is known to have points or not
+    TilePointsExplored,
     EnergyField,
 }
 
+#[derive(Debug, Clone, Copy, EnumCount, EnumIter)]
+enum TemporalGlobalFeature {
+    MyTeamPoints,
+    OppTeamPoints,
+    PointsDiff,
+}
+
 #[derive(Debug, Clone, Copy, EnumIter)]
-enum GlobalFeature {
+enum NontemporalGlobalFeature {
     // Visible features
-    MyTeamId = 0,
-    MyTeamPoints = 2,
-    OppTeamPoints = 3,
-    MyTeamWins = 4,
-    OppTeamWins = 7,
-    MatchSteps = 10,
+    MyTeamWins = 0,
+    OppTeamWins = 3,
+    MatchSteps = 6,
     // Known parameters
-    UnitMoveCost = 11,
-    UnitSapCost = 16,
-    UnitSapRange = 17,
-    UnitSensorRange = 22,
+    UnitMoveCost = 7,
+    UnitSapCost = 12,
+    UnitSapRange = 13,
+    UnitSensorRange = 18,
     // Estimated / inferred features
-    UnitSapDropoffFactor = 25,
-    NebulaTileVisionReduction = 28,
-    NebulaTileEnergyReduction = 32,
-    NebulaTileDriftSpeed = 35,
-    EnergyNodeDriftSpeed = 39,
-    End = 44,
+    UnitSapDropoffFactor = 21,
+    NebulaTileVisionReduction = 24,
+    NebulaTileEnergyReduction = 28,
+    NebulaTileDriftSpeed = 31,
+    EnergyNodeDriftSpeed = 35,
+    End = 39,
 }
 
 // Normalizing constants
-const UNIT_COUNT_NORM: f32 = 4.0;
-const UNIT_ENERGY_NORM: f32 = 400.0;
+static VISION_NORM: LazyLock<f32> = LazyLock::new(|| {
+    let max_sensor_range =
+        *PARAM_RANGES.unit_sensor_range.iter().max().unwrap();
+    let norm = 4 * (max_sensor_range + 1);
+    norm as f32
+});
+const UNIT_COUNT_NORM: f32 = 4.;
+const UNIT_ENERGY_NORM: f32 = FIXED_PARAMS.max_unit_energy as f32;
 const UNIT_ENERGY_MIN_BASELINE: f32 = 0.1;
-const ENERGY_FIELD_NORM: f32 = 7.0;
+static ENERGY_FIELD_NORM: LazyLock<f32> = LazyLock::new(|| {
+    *PARAM_RANGES
+        .nebula_tile_energy_reduction
+        .iter()
+        .max()
+        .unwrap() as f32
+});
+const MANHATTAN_DISTANCE_NORM: f32 =
+    (FIXED_PARAMS.map_width + FIXED_PARAMS.map_height) as f32;
+const POINTS_NORM: f32 = 200.;
+const POINTS_DIFF_NORM: f32 = POINTS_NORM / 2.;
+
+static UNIT_SAP_COST_MIN: LazyLock<i32> =
+    LazyLock::new(|| *PARAM_RANGES.unit_sap_cost.iter().min().unwrap());
+static UNIT_SAP_COST_MAX: LazyLock<i32> =
+    LazyLock::new(|| *PARAM_RANGES.unit_sap_cost.iter().max().unwrap());
+
+pub fn get_temporal_spatial_feature_count() -> usize {
+    TemporalSpatialFeature::COUNT
+}
+
+pub fn get_nontemporal_spatial_feature_count() -> usize {
+    NontemporalSpatialFeature::COUNT
+}
+
+pub fn get_temporal_global_feature_count() -> usize {
+    TemporalGlobalFeature::COUNT
+}
+
+pub fn get_nontemporal_global_feature_count() -> usize {
+    NontemporalGlobalFeature::End as usize
+}
 
 /// Writes into spatial_out of shape (teams, s_channels, map_width, map_height) and
 /// global_out of shape (teams, g_channels)
 pub fn write_obs_arrays(
-    mut spatial_out: ArrayViewMut4<f32>,
-    mut global_out: ArrayViewMut2<f32>,
+    mut temporal_spatial_out: ArrayViewMut4<f32>,
+    mut nontemporal_spatial_out: ArrayViewMut4<f32>,
+    mut temporal_global_out: ArrayViewMut2<f32>,
+    mut nontemporal_global_out: ArrayViewMut2<f32>,
     observations: &[Observation],
     memories: &[Memory],
     params: &KnownVariableParams,
 ) {
-    for (((obs, mem), team_spatial_out), team_global_out) in observations
-        .iter()
-        .zip_eq(memories)
-        .zip_eq(spatial_out.outer_iter_mut())
-        .zip_eq(global_out.outer_iter_mut())
-    {
-        write_team_obs(team_spatial_out, team_global_out, obs, mem, params);
+    for (
+        obs,
+        mem,
+        temporal_spatial_out,
+        nontemporal_spatial_out,
+        temporal_global_out,
+        nontemporal_global_out,
+    ) in izip_eq!(
+        observations,
+        memories,
+        temporal_spatial_out.outer_iter_mut(),
+        nontemporal_spatial_out.outer_iter_mut(),
+        temporal_global_out.outer_iter_mut(),
+        nontemporal_global_out.outer_iter_mut(),
+    ) {
+        write_temporal_spatial_out(temporal_spatial_out, obs, mem, params);
+        write_nontemporal_spatial_out(
+            nontemporal_spatial_out,
+            obs,
+            mem,
+            params,
+        );
+        write_temporal_global_out(temporal_global_out, obs);
+        write_nontemporal_global_out(nontemporal_global_out, obs, mem, params);
     }
 }
 
-pub fn get_spatial_feature_count() -> usize {
-    SpatialFeature::COUNT
-}
-
-pub fn get_global_feature_count() -> usize {
-    GlobalFeature::End as usize
-}
-
-fn write_team_obs(
-    mut spatial_out: ArrayViewMut3<f32>,
-    mut global_out: ArrayViewMut1<f32>,
+fn write_temporal_spatial_out(
+    mut temporal_spatial_out: ArrayViewMut3<f32>,
     obs: &Observation,
     mem: &Memory,
     params: &KnownVariableParams,
 ) {
-    use GlobalFeature::*;
-    use SpatialFeature::*;
+    use TemporalSpatialFeature::*;
 
-    for (sf, mut slice) in
-        SpatialFeature::iter().zip_eq(spatial_out.outer_iter_mut())
+    for (sf, mut slice) in TemporalSpatialFeature::iter()
+        .zip_eq(temporal_spatial_out.outer_iter_mut())
     {
         match sf {
             Visible => {
-                slice.assign(
-                    &obs.sensor_mask.map(|v| if *v { 1.0 } else { 0.0 }),
+                Zip::from(&mut slice).and(&obs.sensor_mask).for_each(
+                    |out, &visible| *out = if visible { 1.0 } else { 0.0 },
                 );
             },
+            EstimatedVisionPower => {
+                let mut estimated_vision_power_map = estimate_vision_power_map(
+                    obs.get_my_units(),
+                    FIXED_PARAMS.map_size,
+                    params.unit_sensor_range,
+                );
+                // Pessimistically estimate nebula tile vision reduction
+                let nebula_vision_cost = mem
+                    .iter_unmasked_nebula_tile_vision_reduction_options()
+                    .max()
+                    .unwrap();
+                for nebula in &obs.nebulae {
+                    estimated_vision_power_map[nebula.as_index()] -=
+                        nebula_vision_cost;
+                }
+                Zip::from(&mut slice)
+                    .and(&estimated_vision_power_map)
+                    .and(&obs.sensor_mask)
+                    .for_each(|out, &vision_estimate, &visible| {
+                        let vision_power =
+                            if visible { vision_estimate.max(0) } else { 0 };
+                        *out = vision_power as f32 / *VISION_NORM;
+                    })
+            },
             MyUnitCount => {
-                write_unit_counts(slice, obs.get_my_units());
+                write_alive_unit_counts(slice, obs.get_my_units());
             },
             OppUnitCount => {
-                write_unit_counts(slice, obs.get_opp_units());
-            },
-            MyDeadUnitCount => {
-                write_dead_unit_counts(slice, obs.get_my_units());
-            },
-            OppDeadUnitCount => {
-                write_dead_unit_counts(slice, obs.get_opp_units());
+                write_alive_unit_counts(slice, obs.get_opp_units());
             },
             MyUnitEnergy => {
                 write_unit_energies(slice, obs.get_my_units());
             },
             OppUnitEnergy => {
                 write_unit_energies(slice, obs.get_opp_units());
+            },
+        }
+    }
+}
+
+fn write_nontemporal_spatial_out(
+    mut nontemporal_spatial_out: ArrayViewMut3<f32>,
+    obs: &Observation,
+    mem: &Memory,
+    params: &KnownVariableParams,
+) {
+    use NontemporalSpatialFeature::*;
+
+    for (sf, mut slice) in NontemporalSpatialFeature::iter()
+        .zip_eq(nontemporal_spatial_out.outer_iter_mut())
+    {
+        match sf {
+            DistanceFromSpawn => {
+                let spawn_pos =
+                    get_spawn_position(obs.team_id, FIXED_PARAMS.map_size);
+                slice.indexed_iter_mut().for_each(|(xy, out)| {
+                    *out = spawn_pos.manhattan_distance(xy.into()) as f32
+                        / MANHATTAN_DISTANCE_NORM;
+                });
+            },
+            MyUnitCanMove => {
+                write_units_have_enough_energy_counts(
+                    slice,
+                    obs.get_my_units(),
+                    params.unit_move_cost,
+                );
+            },
+            OppUnitCanMove => {
+                write_units_have_enough_energy_counts(
+                    slice,
+                    obs.get_opp_units(),
+                    params.unit_move_cost,
+                );
+            },
+            MyUnitCanSap => {
+                write_units_have_enough_energy_counts(
+                    slice,
+                    obs.get_my_units(),
+                    params.unit_sap_cost,
+                );
+            },
+            OppUnitCanSap => {
+                write_units_have_enough_energy_counts(
+                    slice,
+                    obs.get_opp_units(),
+                    params.unit_sap_cost,
+                );
+            },
+            MyDeadUnitCount => {
+                write_dead_unit_counts(slice, obs.get_my_units());
+            },
+            OppDeadUnitCount => {
+                write_dead_unit_counts(slice, obs.get_opp_units());
             },
             MyUnitEnergyMin => {
                 write_unit_energy_min(slice, obs.get_my_units());
@@ -163,42 +311,76 @@ fn write_team_obs(
                 .for_each(|out, &explored| {
                     *out = if explored { 1.0 } else { 0.0 }
                 }),
-            RelicNodePoints => slice.assign(mem.get_relic_points_map()),
-            RelicNodePointsKnown => Zip::from(&mut slice)
-                .and(mem.get_known_relic_points_map())
+            TileKnownPoints => Zip::from(&mut slice)
+                .and(mem.get_relic_known_and_explored_points_map())
+                .for_each(|out, &known_and_explored| {
+                    *out = if known_and_explored { 1.0 } else { 0.0 }
+                }),
+            TileEstimatedPoints => {
+                slice.assign(mem.get_relic_estimated_points_map())
+            },
+            TilePointsExplored => Zip::from(&mut slice)
+                .and(mem.get_relic_explored_points_map())
                 .for_each(|out, &explored| {
                     *out = if explored { 1.0 } else { 0.0 }
                 }),
-            EnergyField => Zip::from(&mut slice)
-                .and(mem.get_energy_field())
-                .for_each(|out, &energy| {
-                    if let Some(e) = energy {
-                        *out = e as f32 / ENERGY_FIELD_NORM
-                    }
-                }),
+            EnergyField => {
+                // Optimistically estimate nebula tile energy reduction
+                let nebula_cost = mem
+                    .iter_unmasked_nebula_tile_energy_reduction_options()
+                    .min()
+                    .unwrap();
+                Zip::from(&mut slice)
+                    .and(mem.get_energy_field())
+                    .and(mem.get_known_nebulae_map())
+                    .for_each(|out, &energy, &is_nebula| {
+                        if let Some(e) = energy {
+                            let e = if is_nebula { e - nebula_cost } else { e };
+                            *out = e as f32 / *ENERGY_FIELD_NORM
+                        }
+                    })
+            },
         }
     }
+}
 
-    let mut global_result: Vec<f32> = vec![0.0; End as usize];
-    for (gf, next_gf) in GlobalFeature::iter().tuple_windows() {
+fn write_temporal_global_out(
+    mut temporal_global_out: ArrayViewMut1<f32>,
+    obs: &Observation,
+) {
+    use TemporalGlobalFeature::*;
+
+    for (gf, out) in
+        TemporalGlobalFeature::iter().zip_eq(temporal_global_out.iter_mut())
+    {
         match gf {
-            MyTeamId => {
-                let onehot_team_id = match obs.team_id {
-                    0 => [1., 0.],
-                    1 => [0., 1.],
-                    _ => unreachable!(),
-                };
-                global_result[gf as usize..next_gf as usize]
-                    .copy_from_slice(&onehot_team_id);
-            },
             MyTeamPoints => {
-                global_result[gf as usize] =
-                    obs.team_points[obs.team_id] as f32;
+                *out = obs.team_points[obs.team_id] as f32 / POINTS_NORM;
             },
             OppTeamPoints => {
-                global_result[gf as usize] =
-                    obs.team_points[1 - obs.team_id] as f32;
+                *out = obs.team_points[obs.opp_team_id()] as f32 / POINTS_NORM;
             },
+            PointsDiff => {
+                *out = (obs.team_points[obs.team_id] as i32
+                    - obs.team_points[obs.opp_team_id()] as i32)
+                    as f32
+                    / POINTS_DIFF_NORM;
+            },
+        }
+    }
+}
+
+fn write_nontemporal_global_out(
+    mut nontemporal_global_out: ArrayViewMut1<f32>,
+    obs: &Observation,
+    mem: &Memory,
+    params: &KnownVariableParams,
+) {
+    use NontemporalGlobalFeature::*;
+
+    let mut global_result: Vec<f32> = vec![0.0; End as usize];
+    for (gf, next_gf) in NontemporalGlobalFeature::iter().tuple_windows() {
+        match gf {
             MyTeamWins => {
                 let my_team_wins =
                     discretize_team_wins(obs.team_wins[obs.team_id]);
@@ -217,7 +399,7 @@ fn write_team_obs(
             },
             UnitMoveCost => {
                 global_result[gf as usize..next_gf as usize].copy_from_slice(
-                    &one_hot_encode_param_range(
+                    &one_hot_float_encode_param_range(
                         params.unit_move_cost,
                         &PARAM_RANGES.unit_move_cost,
                     ),
@@ -230,7 +412,7 @@ fn write_team_obs(
             },
             UnitSapRange => {
                 global_result[gf as usize..next_gf as usize].copy_from_slice(
-                    &one_hot_encode_param_range(
+                    &one_hot_float_encode_param_range(
                         params.unit_sap_range,
                         &PARAM_RANGES.unit_sap_range,
                     ),
@@ -238,7 +420,7 @@ fn write_team_obs(
             },
             UnitSensorRange => {
                 global_result[gf as usize..next_gf as usize].copy_from_slice(
-                    &one_hot_encode_param_range(
+                    &one_hot_float_encode_param_range(
                         params.unit_sensor_range,
                         &PARAM_RANGES.unit_sensor_range,
                     ),
@@ -274,17 +456,23 @@ fn write_team_obs(
             },
         }
     }
-    global_out
+    nontemporal_global_out
         .iter_mut()
         .zip_eq(global_result)
         .for_each(|(out, v)| *out = v);
 }
 
-fn write_unit_counts(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
+fn write_alive_unit_counts(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
     units
         .iter()
         .filter(|u| u.alive())
         .for_each(|u| slice[u.pos.as_index()] += 1. / UNIT_COUNT_NORM);
+}
+
+fn write_unit_energies(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
+    units.iter().filter(|u| u.alive()).for_each(|u| {
+        slice[u.pos.as_index()] += u.energy as f32 / UNIT_ENERGY_NORM
+    });
 }
 
 fn write_dead_unit_counts(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
@@ -294,10 +482,15 @@ fn write_dead_unit_counts(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
         .for_each(|u| slice[u.pos.as_index()] += 1. / UNIT_COUNT_NORM);
 }
 
-fn write_unit_energies(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
-    units.iter().filter(|u| u.alive()).for_each(|u| {
-        slice[u.pos.as_index()] += u.energy as f32 / UNIT_ENERGY_NORM
-    });
+fn write_units_have_enough_energy_counts(
+    mut slice: ArrayViewMut2<f32>,
+    units: &[Unit],
+    energy: i32,
+) {
+    units
+        .iter()
+        .filter(|u| u.energy >= energy)
+        .for_each(|u| slice[u.pos.as_index()] += 1. / UNIT_COUNT_NORM);
 }
 
 fn write_unit_energy_min(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
@@ -328,32 +521,27 @@ fn discretize_team_wins(wins: u32) -> [f32; 3] {
     }
 }
 
-fn one_hot_encode_param_range<T>(val: T, range: &[T]) -> Vec<f32>
-where
-    T: Copy + Eq,
-{
-    let mut encoded = vec![0.0; range.len()];
-    encoded[range.iter().position(|&v| v == val).unwrap()] = 1.0;
-    encoded
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rules_engine::param_ranges::PARAM_RANGES;
-    use crate::rules_engine::params::P;
-    use GlobalFeature::*;
+    use crate::feature_engineering::replay;
+    use crate::feature_engineering::replay::run_replay;
+    use crate::rules_engine::param_ranges::{
+        IRRELEVANT_ENERGY_NODE_DRIFT_SPEED, PARAM_RANGES,
+    };
+    use numpy::ndarray::{s, Array2, Array4, ArrayViewD, Axis};
+    use rstest::rstest;
+    use std::cmp::Ordering;
+    use std::path::PathBuf;
 
     #[test]
-    fn test_global_feature_indices() {
-        for (feature, next_feature) in GlobalFeature::iter().tuple_windows() {
+    fn test_nontemporal_global_feature_indices() {
+        use NontemporalGlobalFeature::*;
+
+        for (feature, next_feature) in
+            NontemporalGlobalFeature::iter().tuple_windows()
+        {
             match feature {
-                MyTeamId => {
-                    assert_eq!(
-                        next_feature as isize - feature as isize,
-                        P as isize
-                    );
-                },
                 MyTeamWins | OppTeamWins => {
                     let option_count = discretize_team_wins(0).len();
                     assert_eq!(
@@ -450,6 +638,9 @@ mod tests {
                         .energy_node_drift_speed
                         .iter()
                         .sorted_by(|a, b| a.partial_cmp(b).unwrap())
+                        .filter(|&&speed| {
+                            speed != IRRELEVANT_ENERGY_NODE_DRIFT_SPEED
+                        })
                         .dedup()
                         .count();
                     assert_eq!(
@@ -471,6 +662,141 @@ mod tests {
             let mut expected = [0.; 3];
             expected[wins.min(2)] = 1.;
             assert_eq!(discretize_team_wins(wins as u32), expected);
+        }
+    }
+
+    fn f32_cmp(a: &f32, b: &f32) -> Ordering {
+        a.partial_cmp(b).unwrap()
+    }
+
+    fn update_ranges(array: ArrayViewD<f32>, ranges: &mut [[f32; 2]]) {
+        for (slice, [min_val, max_val]) in
+            array.outer_iter().zip_eq(ranges.iter_mut())
+        {
+            *min_val =
+                min_val.min(slice.iter().copied().min_by(f32_cmp).unwrap());
+            *max_val =
+                max_val.max(slice.iter().copied().max_by(f32_cmp).unwrap());
+        }
+    }
+
+    #[rstest]
+    #[ignore = "slow"]
+    fn test_observation_ranges(
+        #[files("src/feature_engineering/test_data/*.json")] path: PathBuf,
+    ) {
+        let full_replay = replay::load_replay(path);
+        let params =
+            KnownVariableParams::from(full_replay.params.variable.clone());
+        let mut memories = [
+            [Memory::new(&PARAM_RANGES, FIXED_PARAMS.map_size)],
+            [Memory::new(&PARAM_RANGES, FIXED_PARAMS.map_size)],
+        ];
+        let mut temporal_spatial_obs = Array4::zeros((
+            1,
+            get_temporal_spatial_feature_count(),
+            FIXED_PARAMS.map_width,
+            FIXED_PARAMS.map_height,
+        ));
+        let mut nontemporal_spatial_obs = Array4::zeros((
+            1,
+            get_nontemporal_spatial_feature_count(),
+            FIXED_PARAMS.map_width,
+            FIXED_PARAMS.map_height,
+        ));
+        let mut temporal_global_obs =
+            Array2::zeros((1, get_temporal_global_feature_count()));
+        let mut nontemporal_global_obs =
+            Array2::zeros((1, get_nontemporal_global_feature_count()));
+        let mut temporal_spatial_ranges =
+            vec![[0_f32, 0_f32]; get_temporal_spatial_feature_count()];
+        let mut nontemporal_spatial_ranges =
+            vec![[0_f32, 0_f32]; get_nontemporal_spatial_feature_count()];
+        let mut temporal_global_ranges =
+            vec![[0_f32, 0_f32]; get_temporal_global_feature_count()];
+        let mut nontemporal_global_ranges =
+            vec![[0_f32, 0_f32]; get_nontemporal_global_feature_count()];
+
+        for (_state, actions, obs, _next_state) in run_replay(&full_replay) {
+            for (mem, actions, obs) in
+                izip_eq!(memories.iter_mut(), actions, obs)
+            {
+                temporal_spatial_obs.fill(0.);
+                nontemporal_spatial_obs.fill(0.);
+                temporal_global_obs.fill(0.);
+                nontemporal_global_obs.fill(0.);
+
+                mem[0].update(&obs, &actions, &FIXED_PARAMS, &params);
+                write_obs_arrays(
+                    temporal_spatial_obs.view_mut(),
+                    nontemporal_spatial_obs.view_mut(),
+                    temporal_global_obs.view_mut(),
+                    nontemporal_global_obs.view_mut(),
+                    &[obs],
+                    mem,
+                    &params,
+                );
+                // It's okay if corner values have outliers (such as stacks of units)
+                let top_left_slice = s![.., .., 0, 0];
+                let bottom_right_slice = s![
+                    ..,
+                    ..,
+                    FIXED_PARAMS.map_width - 1,
+                    FIXED_PARAMS.map_height - 1
+                ];
+                temporal_spatial_obs.slice_mut(top_left_slice).fill(0.);
+                temporal_spatial_obs.slice_mut(bottom_right_slice).fill(0.);
+                nontemporal_spatial_obs.slice_mut(top_left_slice).fill(0.);
+                nontemporal_spatial_obs
+                    .slice_mut(bottom_right_slice)
+                    .fill(0.);
+
+                update_ranges(
+                    temporal_spatial_obs
+                        .index_axis(Axis(0), 0)
+                        .view()
+                        .into_dyn(),
+                    &mut temporal_spatial_ranges,
+                );
+                update_ranges(
+                    nontemporal_spatial_obs
+                        .index_axis(Axis(0), 0)
+                        .view()
+                        .into_dyn(),
+                    &mut nontemporal_spatial_ranges,
+                );
+                update_ranges(
+                    temporal_global_obs
+                        .index_axis(Axis(0), 0)
+                        .view()
+                        .into_dyn(),
+                    &mut temporal_global_ranges,
+                );
+                update_ranges(
+                    nontemporal_global_obs
+                        .index_axis(Axis(0), 0)
+                        .view()
+                        .into_dyn(),
+                    &mut nontemporal_global_ranges,
+                )
+            }
+        }
+
+        let bound = 5.;
+        for &[min_val, max_val] in temporal_spatial_ranges
+            .iter()
+            .chain(nontemporal_spatial_ranges.iter())
+            .chain(temporal_global_ranges.iter())
+            .chain(nontemporal_global_ranges.iter())
+        {
+            println!("{:?}", (min_val, bound, max_val));
+            if min_val >= 0. {
+                assert!(min_val <= 1.);
+                assert!(max_val <= bound);
+            } else {
+                assert!(min_val >= -bound);
+                assert!(max_val <= bound);
+            }
         }
     }
 }

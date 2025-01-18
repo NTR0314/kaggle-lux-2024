@@ -1,4 +1,3 @@
-from collections.abc import Sequence
 from enum import Enum
 from typing import NamedTuple, Union
 
@@ -7,6 +6,8 @@ import numpy.typing as npt
 
 ActionArray = npt.NDArray[np.int64]
 ObsArrays = tuple[
+    npt.NDArray[np.float32],
+    npt.NDArray[np.float32],
     npt.NDArray[np.float32],
     npt.NDArray[np.float32],
 ]
@@ -32,27 +33,28 @@ FeatureEngineeringFullOut = tuple[ObsArrays, ActionInfoArrays]
 
 
 class Obs(NamedTuple):
-    spatial_obs: npt.NDArray[np.float32]
-    global_obs: npt.NDArray[np.float32]
+    temporal_spatial_obs: npt.NDArray[np.float32]
+    nontemporal_spatial_obs: npt.NDArray[np.float32]
+    temporal_global_obs: npt.NDArray[np.float32]
+    nontemporal_global_obs: npt.NDArray[np.float32]
 
     def validate(self, n_envs: int, n_players: int) -> None:
-        assert self.spatial_obs.ndim == 5
-        assert self.spatial_obs.dtype == np.float32
-        assert self.global_obs.ndim == 3
-        assert self.global_obs.dtype == np.float32
+        assert self.temporal_spatial_obs.ndim == 5
+        assert self.temporal_spatial_obs.dtype == np.float32
+        assert self.nontemporal_spatial_obs.ndim == 5
+        assert self.temporal_spatial_obs.dtype == np.float32
+
+        assert self.temporal_global_obs.ndim == 3
+        assert self.temporal_global_obs.dtype == np.float32
+        assert self.nontemporal_global_obs.ndim == 3
+        assert self.nontemporal_global_obs.dtype == np.float32
+
         for array in self:
             assert array.shape[:2] == (n_envs, n_players)
 
     @classmethod
     def from_raw(cls, raw: ObsArrays) -> "Obs":
         return Obs(*raw)
-
-    @classmethod
-    def concatenate_frame_history(cls, frames: Sequence["Obs"], axis: int) -> "Obs":
-        raw_concatenated = [
-            np.concatenate(obs_frames, axis=axis) for obs_frames in zip(*frames)
-        ]
-        return Obs(*raw_concatenated)
 
 
 class ActionInfo(NamedTuple):
@@ -149,6 +151,26 @@ class FeatureEngineeringOut(NamedTuple):
         return FeatureEngineeringOut(
             Obs.from_raw(raw_obs_arrays),
             ActionInfo.from_raw(raw_action_info_arrays),
+        )
+
+
+class FrameStackedObs(NamedTuple):
+    spatial_obs: npt.NDArray[np.float32]
+    global_obs: npt.NDArray[np.float32]
+
+    @classmethod
+    def from_frame_history(cls, frames: list[Obs], axis: int) -> "FrameStackedObs":
+        all_spatial_arrays = [f.temporal_spatial_obs for f in frames]
+        all_spatial_arrays.append(frames[-1].nontemporal_spatial_obs)
+        combined_spatial_obs = np.concatenate(all_spatial_arrays, axis=axis)
+
+        all_global_arrays = [f.temporal_global_obs for f in frames]
+        all_global_arrays.append(frames[-1].nontemporal_global_obs)
+        combined_global_obs = np.concatenate(all_global_arrays, axis=axis)
+
+        return FrameStackedObs(
+            spatial_obs=combined_spatial_obs,
+            global_obs=combined_global_obs,
         )
 
 
