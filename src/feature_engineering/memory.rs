@@ -2,8 +2,6 @@ mod cached_energy_fields;
 mod energy_field;
 mod hidden_parameter;
 mod masked_possibilities;
-#[allow(dead_code)]
-pub mod probabilities;
 mod relic_node;
 mod space_obstacle;
 

@@ -1284,8 +1284,8 @@ mod tests {
 
     #[derive(Deserialize)]
     struct EnergyFieldTestCase {
-        #[allow(dead_code)]
-        seed: u32,
+        #[serde(rename(deserialize = "seed"))]
+        _seed: u32,
         energy_nodes: Vec<[usize; 2]>,
         energy_node_fns: Vec<[f32; 4]>,
         energy_field: Vec<Vec<i32>>,
