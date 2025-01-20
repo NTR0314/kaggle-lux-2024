@@ -137,6 +137,14 @@ def compute_teacher_kl_loss(
     return kl_div.sum(dim=-1).mean()
 
 
+def compute_teacher_value_loss(
+    learner_value_estimate: torch.Tensor,
+    teacher_value_estimate: torch.Tensor,
+) -> torch.Tensor:
+    assert learner_value_estimate.shape == teacher_value_estimate.shape
+    return F.huber_loss(learner_value_estimate, teacher_value_estimate)
+
+
 def get_wandb_log_mode(
     wandb_enabled: bool,
     histograms_enabled: bool,

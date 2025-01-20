@@ -22,6 +22,7 @@ from pydantic import (
     ValidationInfo,
     field_serializer,
     field_validator,
+    model_validator,
 )
 from rux_ai_s3.lowlevel import assert_release_build
 from rux_ai_s3.models.actor_critic import ActorCritic, ActorCriticOut
@@ -34,6 +35,7 @@ from rux_ai_s3.rl_training.ppo import (
     compute_entropy_loss,
     compute_pg_loss,
     compute_teacher_kl_loss,
+    compute_teacher_value_loss,
     compute_value_loss,
     get_wandb_log_mode,
     log_results,
@@ -61,7 +63,7 @@ from torch.optim.lr_scheduler import LambdaLR
 TrainStateT = TrainState[ActorCritic]
 FILE: Final[Path] = Path(__file__)
 NAME: Final[str] = "ppo"
-CONFIG_FILE: Final[Path] = FILE.parent / "config" / f"{NAME}.yaml"
+DEFAULT_CONFIG_FILE: Final[Path] = FILE.parent / "config" / f"{NAME}_default.yaml"
 CHECKPOINT_FREQ: Final[datetime.timedelta] = datetime.timedelta(minutes=20)
 CPU: Final[torch.device] = torch.device("cpu")
 
@@ -97,7 +99,7 @@ class UserArgs(BaseModel):
         if self.config:
             return self.config
 
-        return CONFIG_FILE
+        return DEFAULT_CONFIG_FILE
 
     @field_validator("checkpoint")
     @classmethod
@@ -149,11 +151,37 @@ class LRScheduleConfig(BaseModel):
     )
 
 
+class TeacherLossSchedule(BaseModel):
+    start: Annotated[float, Field(ge=0.0, le=1.0)]
+    end: Annotated[float, Field(ge=0.0, le=1.0)]
+    steps: Annotated[int, Field(ge=1_000, lt=1_000_000)]
+
+    @field_validator("end")
+    @classmethod
+    def _validate_end(cls, end: float, info: ValidationInfo) -> float:
+        start = info.data["start"]
+        if end > start:
+            raise ValueError(f"end {end} > start {start}")
+
+        return end
+
+    def get_coefficient(self, step: int) -> float:
+        decay_progress = 1.0 - min(step / self.steps, 1.0)
+        decayed_coeff = (self.start - self.end) * decay_progress
+        return self.end + decayed_coeff
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+    )
+
+
 class LossCoefficients(BaseModel):
     policy: float
     value: float
     entropy: float
-    teacher_kl: float
+    teacher_policy: TeacherLossSchedule
+    teacher_value: TeacherLossSchedule
 
     model_config = ConfigDict(
         extra="forbid",
@@ -213,6 +241,16 @@ class PPOConfig(TrainConfig):
             return device
 
         return torch.device(device)
+
+    @model_validator(mode="after")
+    def _validate_model(self) -> "PPOConfig":
+        if self.full_batch_size % self.train_batch_size != 0:
+            raise ValueError(
+                f"full_batch_size {self.full_batch_size} % train_batch_size "
+                f"{self.train_batch_size} != 0"
+            )
+
+        return self
 
     @field_serializer("device")
     def serialize_device(self, device: torch.device) -> str:
@@ -466,18 +504,19 @@ def train_step(
         scalar_stats.update(stats.scalar_stats)
         array_stats.update(stats.array_stats)
 
-    time_elapsed = time.perf_counter() - step_start_time
+    total_time = time.perf_counter() - step_start_time
     batches_per_epoch = math.ceil(cfg.full_batch_size / cfg.train_batch_size)
     (scalar_stats["lr"],) = train_state.lr_scheduler.get_last_lr()
     scalar_stats["game_steps"] = train_state.step * cfg.game_steps_per_update
     scalar_stats["updates_per_second"] = (
-        batches_per_epoch * cfg.epochs_per_update / time_elapsed
+        batches_per_epoch * cfg.epochs_per_update / total_time
     )
     scalar_stats["env_steps_per_second"] = (
-        cfg.env_config.n_envs * cfg.steps_per_update / time_elapsed
+        cfg.env_config.n_envs * cfg.steps_per_update / total_time
     )
     scalar_stats["data_collection_time"] = data_collection_time
     scalar_stats["train_time"] = train_time
+    scalar_stats["total_time"] = total_time
     log_results(
         train_state.step,
         scalar_stats,
@@ -533,27 +572,14 @@ def collect_trajectories(
 
 
 def update_model(
-    experience: ExperienceBatch,
+    full_experience: ExperienceBatch,
     train_state: TrainStateT,
     cfg: PPOConfig,
 ) -> dict[str, float]:
-    experience.validate()
-    advantages_np, returns_np = bootstrap_value(
-        value_estimate=experience.model_out.value.cpu().numpy(),
-        reward=experience.reward,
-        done=experience.done,
-        gamma=cfg.gamma,
-        gae_lambda=cfg.gae_lambda,
-    )
-    advantages = torch.from_numpy(advantages_np)
-    returns = torch.from_numpy(returns_np)
-    # Combine batch/player dims for experience batch, advantages, and returns
-    experience = experience.trim().flatten(end_dim=2)
-    advantages = advantages.flatten(start_dim=0, end_dim=2)
-    returns = returns.flatten(start_dim=0, end_dim=2)
+    full_experience.validate()
     aggregated_stats = collections.defaultdict(list)
     for _ in range(cfg.epochs_per_update):
-        assert experience.done.shape[0] == cfg.full_batch_size
+        experience, advantages, returns = prepare_epoch_data(full_experience, cfg)
         for minibatch_start in range(0, cfg.full_batch_size, cfg.train_batch_size):
             minibatch_slice = slice(
                 minibatch_start, minibatch_start + cfg.train_batch_size
@@ -569,6 +595,27 @@ def update_model(
                 aggregated_stats[k].append(v)
 
     return {key: np.mean(val).item() for key, val in aggregated_stats.items()}
+
+
+def prepare_epoch_data(
+    full_experience: ExperienceBatch,
+    cfg: PPOConfig,
+) -> tuple[ExperienceBatch, torch.Tensor, torch.Tensor]:
+    advantages_np, returns_np = bootstrap_value(
+        value_estimate=full_experience.model_out.value.cpu().numpy(),
+        reward=full_experience.reward,
+        done=full_experience.done,
+        gamma=cfg.gamma,
+        gae_lambda=cfg.gae_lambda,
+    )
+    advantages = torch.from_numpy(advantages_np)
+    returns = torch.from_numpy(returns_np)
+    # Combine step/batch/player dims for experience, advantages, and returns
+    experience = full_experience.trim().flatten(end_dim=2)
+    advantages = advantages.flatten(start_dim=0, end_dim=2)
+    returns = returns.flatten(start_dim=0, end_dim=2)
+    assert experience.done.shape[0] == cfg.full_batch_size
+    return experience, advantages, returns
 
 
 def update_model_on_batch(
@@ -628,7 +675,10 @@ def update_model_on_batch(
             units_mask=experience.action_info.units_mask,
         )
         entropy_loss = negative_entropy * cfg.loss_coefficients.entropy
-        teacher_kl_loss = (
+        teacher_policy_coefficient = (
+            cfg.loss_coefficients.teacher_policy.get_coefficient(train_state.step)
+        )
+        teacher_policy_loss = (
             (
                 compute_teacher_kl_loss(
                     learner_main_log_probs=new_out.main_log_probs,
@@ -637,12 +687,32 @@ def update_model_on_batch(
                     teacher_sap_log_probs=teacher_out.sap_log_probs,
                     units_mask=experience.action_info.units_mask,
                 )
-                * cfg.loss_coefficients.teacher_kl
+                * teacher_policy_coefficient
             )
-            if train_state.teacher_model is not None
+            if train_state.teacher_model
             else torch.zeros_like(policy_loss)
         )
-        total_loss = policy_loss + value_loss + entropy_loss + teacher_kl_loss
+        teacher_value_coefficient = cfg.loss_coefficients.teacher_value.get_coefficient(
+            train_state.step
+        )
+        teacher_value_loss = (
+            (
+                compute_teacher_value_loss(
+                    learner_value_estimate=new_out.value,
+                    teacher_value_estimate=teacher_out.value,
+                )
+                * teacher_value_coefficient
+            )
+            if train_state.teacher_model
+            else torch.zeros_like(value_loss)
+        )
+        total_loss = (
+            policy_loss
+            + value_loss
+            + entropy_loss
+            + teacher_policy_loss
+            + teacher_value_loss
+        )
 
     step_optimizer(train_state, total_loss, cfg)
     return {
@@ -650,7 +720,8 @@ def update_model_on_batch(
         "policy_loss": policy_loss.item(),
         "value_loss": value_loss.item(),
         "entropy_loss": entropy_loss.item(),
-        "teacher_kl_loss": teacher_kl_loss.item(),
+        "teacher_policy_loss": teacher_policy_loss.item(),
+        "teacher_value_loss": teacher_value_loss.item(),
         "clip_fraction": clip_fraction,
         "entropy": -negative_entropy.item(),
     }

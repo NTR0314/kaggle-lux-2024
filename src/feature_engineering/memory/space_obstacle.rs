@@ -200,9 +200,12 @@ impl SpaceObstacleMemory {
             + u8::from(negative_drift_possible)
             + u8::from(positive_drift_possible)
         {
-            0 => panic!(
-                "No possible space object movement matches the observation"
-            ),
+            0 => {
+                memory_error(
+                    "No possible space object movement matches the observation",
+                );
+                *self = observed;
+            },
             1 => {
                 if negative_drift_possible {
                     self.apply_drift(negative_drift);

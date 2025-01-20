@@ -53,7 +53,7 @@ from torch.optim.lr_scheduler import LambdaLR
 TrainStateT = TrainState[FactorizedActorCritic]
 FILE: Final[Path] = Path(__file__)
 NAME: Final[str] = "unit_factorized_ppo"
-CONFIG_FILE: Final[Path] = FILE.parent / "config" / f"{NAME}.yaml"
+DEFAULT_CONFIG_FILE: Final[Path] = FILE.parent / "config" / f"{NAME}_default.yaml"
 CHECKPOINT_FREQ: Final[datetime.timedelta] = datetime.timedelta(minutes=10)
 CPU: Final[torch.device] = torch.device("cpu")
 
@@ -78,7 +78,7 @@ class UserArgs(BaseModel):
     @property
     def config_file(self) -> Path:
         if self.checkpoint is None:
-            return CONFIG_FILE
+            return DEFAULT_CONFIG_FILE
 
         return get_config_path_from_checkpoint(self.checkpoint)
 

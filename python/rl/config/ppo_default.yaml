@@ -9,7 +9,7 @@ steps_per_update: 32
 epochs_per_update: 1
 train_batch_size: 128
 use_mixed_precision: true
-teacher_path: train_outputs/ppo/2025_01_11/17_22/checkpoint_250574.pt
+teacher_path: null
 
 gamma: 0.9999
 gae_lambda: 0.85
@@ -18,19 +18,29 @@ loss_coefficients:
   policy: 1.0
   value: 0.5
   entropy: 1e-4
-  # TODO: continue tuning teacher_kl coefficient, and/or teacher KL decay
-  teacher_kl: 5e-4
+  # TODO: tune teacher loss decay
+  # teacher_policy and teacher_value don't have any effect unless
+  # teacher_path is set above
+  teacher_policy:
+    start: 1.0
+    end: 5e-4
+    steps: 20_000
+  teacher_value:
+    start: 0.5
+    end: 0.0
+    steps: 20_000
+
 
 env_config:
   n_envs: 64
-  frame_stack_len: 5
+  frame_stack_len: 10
   # FINAL_WINNER, MATCH_WINNER, or POINTS_SCORED
-  reward_space: FINAL_WINNER
+  reward_space: MATCH_WINNER
   jax_device: cpu:0
 
 rl_model_config:
-  d_model: 256
-  n_blocks: 8
+  d_model: 64
+  n_blocks: 4
 
 device: cuda:0
 log_histograms: false
