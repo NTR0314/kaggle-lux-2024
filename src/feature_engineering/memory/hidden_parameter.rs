@@ -3,7 +3,8 @@ use crate::feature_engineering::utils::memory_error;
 use crate::rules_engine::action::Action;
 use crate::rules_engine::action::Action::{Down, Left, NoOp, Right, Sap, Up};
 use crate::rules_engine::env::{
-    estimate_vision_power_map, just_respawned, ENERGY_VOID_DELTAS,
+    estimate_vision_power_map, get_spawn_position, just_respawned,
+    ENERGY_VOID_DELTAS,
 };
 use crate::rules_engine::param_ranges::ParamRanges;
 use crate::rules_engine::params::{FixedParams, KnownVariableParams};
@@ -77,6 +78,12 @@ impl HiddenParameterMemory {
         variable_params: &KnownVariableParams,
         nebulae_could_have_moved: bool,
     ) {
+        let last_actions = get_realized_last_actions(
+            last_actions,
+            &self.last_obs_data,
+            obs,
+            fixed_params,
+        );
         if self.nebula_tile_vision_reduction.still_unsolved() {
             determine_nebula_tile_vision_reduction(
                 &mut self.nebula_tile_vision_reduction,
@@ -94,19 +101,19 @@ impl HiddenParameterMemory {
                 &mut self.nebula_tile_energy_reduction,
                 obs,
                 &self.last_obs_data,
-                last_actions,
+                &last_actions,
                 fixed_params,
                 variable_params,
             );
         }
         let sap_count_maps = compute_sap_count_maps(
             &self.last_obs_data.my_units,
-            last_actions,
+            &last_actions,
             fixed_params.map_size,
         );
         let aggregate_energy_void_map = compute_aggregate_energy_void_map(
             &self.last_obs_data.my_units,
-            last_actions,
+            &last_actions,
             fixed_params.map_size,
             variable_params.unit_move_cost,
         );
@@ -159,6 +166,66 @@ impl LastObservationData {
             sensor_mask: obs.sensor_mask.clone(),
         }
     }
+}
+
+/// Sometimes, the agent will try to move into an asteroid that it cannot see. In these cases
+/// no energy is spent, so it's functionally the same as a NoOp.
+fn get_realized_last_actions(
+    last_actions: &[Action],
+    last_obs: &LastObservationData,
+    obs: &Observation,
+    fixed_params: &FixedParams,
+) -> Vec<Option<Action>> {
+    let id_to_unit_now: BTreeMap<usize, Unit> =
+        obs.get_my_units().iter().map(|u| (u.id, *u)).collect();
+    let mut updated_actions =
+        last_actions.iter().copied().map(Option::from).collect_vec();
+    for (unit_last_turn, unit_now, expected_pos) in last_obs
+        .my_units
+        .iter()
+        .filter(|u_last| u_last.alive())
+        .filter_map(|u_last| match last_actions[u_last.id] {
+            move_action @ (Up | Right | Down | Left) => {
+                let new_pos = u_last
+                    .pos
+                    .maybe_translate(
+                        move_action.as_move_delta().unwrap(),
+                        fixed_params.map_size,
+                    )
+                    .unwrap();
+                Some((u_last, id_to_unit_now.get(&u_last.id), new_pos))
+            },
+            NoOp | Sap(_) => None,
+        })
+        // If we could see where we were moving to, then it's known that there was no asteroid
+        .filter(|(_, _, new_pos)| !last_obs.sensor_mask[new_pos.as_index()])
+    {
+        // If our unit died and was removed on the spot (such as from a collision), then we can't
+        // say for sure if the move succeeded or not
+        let Some(unit_now) = unit_now else {
+            updated_actions[unit_last_turn.id] = None;
+            continue;
+        };
+        // This is the same case as above
+        if just_respawned(unit_now, obs.match_steps, obs.team_id, fixed_params)
+        {
+            updated_actions[unit_last_turn.id] = None;
+            continue;
+        }
+        // If the move action succeeded, do nothing
+        if unit_now.pos == expected_pos {
+            continue;
+        }
+        // Here, the move action failed and we know it
+        assert_eq!(
+            unit_now.pos,
+            unit_last_turn.pos,
+            "{:?}",
+            (unit_last_turn, unit_now)
+        );
+        updated_actions[unit_last_turn.id] = Some(NoOp);
+    }
+    updated_actions
 }
 
 fn determine_nebula_tile_vision_reduction(
@@ -216,7 +283,7 @@ fn determine_nebula_tile_energy_reduction(
     nebula_tile_energy_reduction_options: &mut MaskedPossibilities<i32>,
     obs: &Observation,
     last_obs: &LastObservationData,
-    last_actions: &[Action],
+    last_actions: &[Option<Action>],
     fixed_params: &FixedParams,
     params: &KnownVariableParams,
 ) {
@@ -228,21 +295,21 @@ fn determine_nebula_tile_energy_reduction(
     // position and compare it to last turn's nebulae and energy field. Confusingly enough,
     // last turn's energy field is provided in this turn's observation.
     let options_before_update = nebula_tile_energy_reduction_options.clone();
-    let id_to_unit: BTreeMap<usize, Unit> =
+    let id_to_unit_now: BTreeMap<usize, Unit> =
         obs.get_my_units().iter().map(|u| (u.id, *u)).collect();
     // NB: This assumes that units don't take invalid actions (like moving into an asteroid)
     for (energy_before_nebula, actual) in last_obs
         .my_units
         .iter()
-        // Skip units that died last turn
-        .filter(|u_last_turn| u_last_turn.alive())
         .filter_map(|unit_last_turn| {
-            id_to_unit
+            id_to_unit_now
                 .get(&unit_last_turn.id)
                 .map(|unit_now| (unit_last_turn, unit_now))
         })
         // Skip units that could have just respawned
-        .filter(|(_, u_now)| !just_respawned(u_now, obs.team_id, fixed_params))
+        .filter(|(_, u_now)| {
+            !just_respawned(u_now, obs.match_steps, obs.team_id, fixed_params)
+        })
         .filter(|(_, unit_now)| {
             last_obs.nebulae.contains(&unit_now.pos)
                 && unit_now.alive()
@@ -255,7 +322,11 @@ fn determine_nebula_tile_energy_reduction(
                 })
         })
         .filter_map(|(unit_last_turn, unit_now)| {
-            let energy_after_action = match last_actions[unit_last_turn.id] {
+            // The only way to be missing the last action is if it just respawned or is missing
+            // from id_to_unit_now - both conditions that should be filtered away
+            let energy_after_action = match last_actions[unit_last_turn.id]
+                .expect("Missing last_action")
+            {
                 NoOp => unit_last_turn.energy,
                 Up | Right | Down | Left => {
                     unit_last_turn.energy - params.unit_move_cost
@@ -292,14 +363,14 @@ fn determine_nebula_tile_energy_reduction(
 
 fn compute_sap_count_maps(
     units_last_turn: &[Unit],
-    last_actions: &[Action],
+    last_actions: &[Option<Action>],
     map_size: [usize; 2],
 ) -> (BTreeMap<Pos, i32>, BTreeMap<Pos, i32>) {
     // NB: Assumes that all units that tried to sap had enough energy and were successful
     let mut sap_count = BTreeMap::new();
     let mut adjacent_sap_count = BTreeMap::new();
     for sap_target_pos in units_last_turn.iter().filter_map(|u| {
-        if let Sap(sap_deltas) = last_actions[u.id] {
+        if let Some(Sap(sap_deltas)) = last_actions[u.id] {
             Some(
                 u.pos
                     .maybe_translate(sap_deltas, map_size)
@@ -327,16 +398,20 @@ fn compute_sap_count_maps(
 
 fn compute_aggregate_energy_void_map(
     units_last_turn: &[Unit],
-    last_actions: &[Action],
+    last_actions: &[Option<Action>],
     map_size: [usize; 2],
     unit_move_cost: i32,
-) -> Array2<i32> {
+) -> Option<Array2<i32>> {
     let mut result = Array2::<i32>::zeros(map_size);
-    for ((pos, void_energy), delta) in units_last_turn
+    for (unit, action) in units_last_turn
         .iter()
         .filter(|u| u.alive())
         .map(|u| (u, last_actions[u.id]))
-        .map(|(unit, action)| match action {
+    {
+        // A missing action means that we can't determine where the unit was when its
+        // energy void was computed
+        let action = action?;
+        let (pos_after_action, void_energy) = match action {
             NoOp | Sap(_) => (unit.pos, unit.energy),
             direction @ (Up | Right | Down | Left) => (
                 unit.pos
@@ -347,16 +422,18 @@ fn compute_aggregate_energy_void_map(
                     .expect("Got invalid move action"),
                 unit.energy - unit_move_cost,
             ),
-        })
-        .cartesian_product(ENERGY_VOID_DELTAS)
-    {
-        let Some(void_pos) = pos.maybe_translate(delta, map_size) else {
-            continue;
         };
-        assert!(void_energy >= 0, "void_energy < 0");
-        result[void_pos.as_index()] += void_energy;
+        for delta in ENERGY_VOID_DELTAS {
+            let Some(void_pos) =
+                pos_after_action.maybe_translate(delta, map_size)
+            else {
+                continue;
+            };
+            assert!(void_energy >= 0, "void_energy < 0");
+            result[void_pos.as_index()] += void_energy;
+        }
     }
-    result
+    Some(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -366,7 +443,7 @@ fn determine_unit_sap_dropoff_factor(
     obs: &Observation,
     last_obs_data: &LastObservationData,
     sap_count_maps: &(BTreeMap<Pos, i32>, BTreeMap<Pos, i32>),
-    aggregate_energy_void_map: &Array2<i32>,
+    aggregate_energy_void_map: &Option<Array2<i32>>,
     fixed_params: &FixedParams,
     params: &KnownVariableParams,
 ) {
@@ -401,7 +478,12 @@ fn determine_unit_sap_dropoff_factor(
         })
         // Skip units that could have just respawned
         .filter(|(_, u_now)| {
-            !just_respawned(u_now, obs.opp_team_id(), fixed_params)
+            !just_respawned(
+                u_now,
+                obs.match_steps,
+                obs.opp_team_id(),
+                fixed_params,
+            )
         })
         // Skip units in nebulae or that could be in nebulae
         .filter(|(_, u_now)| {
@@ -414,9 +496,18 @@ fn determine_unit_sap_dropoff_factor(
                 .map(|&count| (u_last_turn, u_now, count))
         })
         .filter_map(|(u_last_turn, u_now, adj_sap_count)| {
-            let energy_void = aggregate_energy_void_map[u_now.pos.as_index()];
+            let energy_void = aggregate_energy_void_map
+                .as_ref()
+                .map(|void_map| void_map[u_now.pos.as_index()])?;
             if energy_void == 0 {
                 Some((u_last_turn, u_now, adj_sap_count, 0))
+            } else if stacked_with_just_respawned_unit(
+                *u_now,
+                obs,
+                fixed_params,
+            ) {
+                // Skip units that could be stacked with units that just respawned
+                None
             } else if let Some(void_factor) = unit_energy_void_factor {
                 let void_delta = void_factor * energy_void as f32
                     / unit_counts_map[&u_now.pos] as f32;
@@ -427,10 +518,9 @@ fn determine_unit_sap_dropoff_factor(
                 None
             }
         })
-        .filter_map(|(u_last_turn, u_now, sap_count, void_delta)| {
-            obs.energy_field[u_now.pos.as_index()].map(|energy_delta| {
-                (u_last_turn, u_now, sap_count, void_delta, energy_delta)
-            })
+        .map(|(u_last_turn, u_now, sap_count, void_delta)| {
+            let energy_delta = obs.energy_field[u_now.pos.as_index()].unwrap();
+            (u_last_turn, u_now, sap_count, void_delta, energy_delta)
         })
     {
         let direct_sap_loss = sap_count_map
@@ -462,6 +552,16 @@ fn determine_unit_sap_dropoff_factor(
         memory_error("unit_sap_dropoff_factor mask is all false");
         unit_sap_dropoff_factor.mask = unit_sap_dropoff_factor_backup_mask;
     }
+}
+
+fn stacked_with_just_respawned_unit(
+    unit: Unit,
+    obs: &Observation,
+    fixed_params: &FixedParams,
+) -> bool {
+    obs.match_steps.saturating_sub(1) % fixed_params.spawn_rate == 0
+        && unit.pos
+            == get_spawn_position(obs.opp_team_id(), fixed_params.map_size)
 }
 
 fn get_expected_energy(
@@ -518,7 +618,7 @@ fn determine_unit_energy_void_factor(
     obs: &Observation,
     last_obs_data: &LastObservationData,
     sap_count_maps: &(BTreeMap<Pos, i32>, BTreeMap<Pos, i32>),
-    aggregate_energy_void_map: &Array2<i32>,
+    aggregate_energy_void_map: &Option<Array2<i32>>,
     fixed_params: &FixedParams,
     params: &KnownVariableParams,
 ) {
@@ -551,9 +651,9 @@ fn determine_unit_energy_void_factor(
                 .get(&u_last_turn.id)
                 .map(|u_now| (u_last_turn, u_now))
         })
-        // Skip units that could have just respawned
+        // Skip units that could be stacked with units that just respawned
         .filter(|(_, u_now)| {
-            !just_respawned(u_now, obs.opp_team_id(), fixed_params)
+            !stacked_with_just_respawned_unit(**u_now, obs, fixed_params)
         })
         // Skip units in nebulae or that could be in nebulae
         .filter(|(_, u_now)| {
@@ -561,12 +661,12 @@ fn determine_unit_energy_void_factor(
                 && last_obs_data.sensor_mask[u_now.pos.as_index()]
         })
         .filter_map(|(u_last_turn, u_now)| {
-            let agg_energy_void =
-                aggregate_energy_void_map[u_now.pos.as_index()];
-            if agg_energy_void == 0 {
-                None
-            } else {
-                Some((u_last_turn, u_now, agg_energy_void))
+            let agg_energy_void = aggregate_energy_void_map
+                .as_ref()
+                .map(|void_map| void_map[u_now.pos.as_index()]);
+            match agg_energy_void {
+                None | Some(0) => None,
+                Some(void) => Some((u_last_turn, u_now, void)),
             }
         })
         .filter_map(|(u_last_turn, u_now, agg_energy_void)| {
@@ -587,10 +687,9 @@ fn determine_unit_energy_void_factor(
                 },
             }
         })
-        .filter_map(|(u_last_turn, u_now, energy_void, adj_sap_loss)| {
-            obs.energy_field[u_now.pos.as_index()].map(|energy_delta| {
-                (u_last_turn, u_now, energy_void, adj_sap_loss, energy_delta)
-            })
+        .map(|(u_last_turn, u_now, energy_void, adj_sap_loss)| {
+            let energy_delta = obs.energy_field[u_now.pos.as_index()].unwrap();
+            (u_last_turn, u_now, energy_void, adj_sap_loss, energy_delta)
         })
     {
         let direct_sap_loss = sap_count_map
@@ -599,7 +698,7 @@ fn determine_unit_energy_void_factor(
         for (&void_factor, mask) in
             unit_energy_void_factor.iter_unmasked_options_mut_mask()
         {
-            let energy_void_loss = (agg_energy_void as f32 * void_factor
+            let energy_void_loss = (void_factor * agg_energy_void as f32
                 / unit_counts_map[&opp_unit_now.pos] as f32)
                 as i32;
             let energy_after_combat = opp_unit_last_turn.energy
@@ -639,23 +738,81 @@ mod tests {
     use crate::rules_engine::params::FIXED_PARAMS;
     use crate::rules_engine::state::{Pos, Unit};
     use numpy::ndarray::arr2;
-    use pretty_assertions::assert_eq;
+    use pretty_assertions::assert_eq as pretty_assert_eq;
     use rstest::rstest;
+
+    #[test]
+    fn test_get_realized_last_actions() {
+        let last_actions = vec![Down, Sap([0, 0]), Down, Sap([0, 0]), Up];
+        let zipped_units = vec![
+            // Base case
+            (
+                Unit::new(Pos::new(1, 1), 100, 0),
+                Unit::new(Pos::new(1, 2), 100, 0),
+            ),
+            // Fails to move - replace with NoOp (and skips id = 1)
+            (
+                Unit::new(Pos::new(1, 1), 100, 2),
+                Unit::new(Pos::new(1, 1), 100, 2),
+            ),
+            // Leaves sap actions as-is
+            (
+                Unit::new(Pos::new(1, 1), 100, 3),
+                Unit::new(Pos::new(1, 1), 100, 3),
+            ),
+            // Ignores units that just respawned if they could have run into a hidden asteroid
+            (
+                Unit::new(Pos::new(1, 1), 50, 4),
+                Unit::new(Pos::new(0, 0), 100, 4),
+            ),
+        ];
+        let (units_last_turn, units_now): (Vec<_>, Vec<_>) =
+            zipped_units.into_iter().unzip();
+        let obs = Observation {
+            team_id: 0,
+            units: [units_now, Vec::new()],
+            sensor_mask: Array2::default(FIXED_PARAMS.map_size),
+            match_steps: FIXED_PARAMS.spawn_rate + 1,
+            ..Default::default()
+        };
+        let mut last_obs = LastObservationData {
+            my_units: units_last_turn,
+            sensor_mask: Array2::from_elem(FIXED_PARAMS.map_size, true),
+            ..Default::default()
+        };
+        last_obs.sensor_mask[[1, 2]] = false;
+        last_obs.sensor_mask[[1, 0]] = false;
+        let result = get_realized_last_actions(
+            &last_actions,
+            &last_obs,
+            &obs,
+            &FIXED_PARAMS,
+        );
+        let expected_result = vec![
+            Some(Down),
+            Some(Sap([0, 0])),
+            Some(NoOp),
+            Some(Sap([0, 0])),
+            None,
+        ];
+        assert_eq!(result, expected_result);
+    }
 
     #[test]
     fn test_determine_nebula_tile_vision_reduction() {
         let mut possibilities =
             MaskedPossibilities::from_options(vec![0, 1, 2]);
-        let map_size = [3, 3];
-        let unit_sensor_range = 1;
+        let map_size = [4, 4];
+        let unit_sensor_range = 2;
 
         let obs = Observation {
             sensor_mask: arr2(&[
-                [true, false, true],
-                [false, false, true],
-                [true, true, true],
+                [true, true, true, false],
+                [true, true, true, true],
+                [true, true, true, true],
+                [false, false, false, false],
             ]),
-            units: [vec![Unit::with_pos(Pos::new(0, 0))], Vec::new()],
+            units: [vec![Unit::with_pos(Pos::new(0, 1))], Vec::new()],
             nebulae: vec![Pos::new(0, 0)],
             ..Default::default()
         };
@@ -680,12 +837,12 @@ mod tests {
         let mut possibilities =
             MaskedPossibilities::new(vec![0, 1, 2], mask.to_vec());
         let map_size = [3, 3];
-        let unit_sensor_range = 1;
+        let unit_sensor_range = 2;
 
         let obs = Observation {
             sensor_mask: arr2(&[
-                [false, false, true],
-                [false, false, true],
+                [true, false, true],
+                [true, true, true],
                 [true, true, true],
             ]),
             units: [vec![Unit::with_pos(Pos::new(0, 0))], Vec::new()],
@@ -699,6 +856,10 @@ mod tests {
             unit_sensor_range,
             false,
         );
+    }
+
+    fn to_vec_some<T>(vec: Vec<T>) -> Vec<Option<T>> {
+        vec.into_iter().map(Option::from).collect_vec()
     }
 
     #[rstest]
@@ -795,7 +956,7 @@ mod tests {
             &mut possibilities,
             &obs,
             &last_obs,
-            &last_actions,
+            &to_vec_some(last_actions),
             &fixed_params,
             &params,
         );
@@ -832,7 +993,7 @@ mod tests {
             &mut possibilities,
             &obs,
             &last_obs,
-            &last_actions,
+            &to_vec_some(last_actions),
             &FIXED_PARAMS,
             &KnownVariableParams::default(),
         );
@@ -855,11 +1016,14 @@ mod tests {
             Sap([-2, -2]),
             Sap([-2, -1]),
         ];
-        let (sap_count, adjacent_sap_count) =
-            compute_sap_count_maps(&units, &actions, FIXED_PARAMS.map_size);
+        let (sap_count, adjacent_sap_count) = compute_sap_count_maps(
+            &units,
+            &to_vec_some(actions),
+            FIXED_PARAMS.map_size,
+        );
         let expected_sap_count =
             BTreeMap::from([(Pos::new(2, 2), 1), (Pos::new(0, 0), 2)]);
-        assert_eq!(sap_count, expected_sap_count);
+        pretty_assert_eq!(sap_count, expected_sap_count);
         let expected_adjacent_sap_count = BTreeMap::from([
             (Pos::new(0, 1), 2),
             (Pos::new(1, 0), 2),
@@ -872,7 +1036,7 @@ mod tests {
             (Pos::new(3, 2), 1),
             (Pos::new(3, 3), 1),
         ]);
-        assert_eq!(adjacent_sap_count, expected_adjacent_sap_count);
+        pretty_assert_eq!(adjacent_sap_count, expected_adjacent_sap_count);
     }
 
     #[test]
@@ -880,7 +1044,11 @@ mod tests {
     fn test_test_compute_sap_count_maps_panics() {
         let units = vec![Unit::new(Pos::new(0, 0), 0, 0)];
         let actions = vec![Sap([-1, -1])];
-        compute_sap_count_maps(&units, &actions, FIXED_PARAMS.map_size);
+        compute_sap_count_maps(
+            &units,
+            &to_vec_some(actions),
+            FIXED_PARAMS.map_size,
+        );
     }
 
     #[test]
@@ -899,15 +1067,19 @@ mod tests {
             Down,
             Sap([0, 0]),
         ];
-        let aggregate_energy_void_map =
-            compute_aggregate_energy_void_map(&units, &actions, [4, 4], 5);
-        let expected_aggregate_energy_void_map = arr2(&[
+        let aggregate_energy_void_map = compute_aggregate_energy_void_map(
+            &units,
+            &to_vec_some(actions),
+            [4, 4],
+            5,
+        );
+        let expected_aggregate_energy_void_map = Some(arr2(&[
             [45, 250, 45, 100],
             [150, 45, 150, 0],
             [0, 50, 0, 0],
             [0, 0, 0, 0],
-        ]);
-        assert_eq!(
+        ]));
+        pretty_assert_eq!(
             aggregate_energy_void_map,
             expected_aggregate_energy_void_map
         );
@@ -920,7 +1092,7 @@ mod tests {
         let actions = vec![Up];
         compute_aggregate_energy_void_map(
             &units,
-            &actions,
+            &to_vec_some(actions),
             FIXED_PARAMS.map_size,
             5,
         );
@@ -933,7 +1105,7 @@ mod tests {
         let actions = vec![Down];
         compute_aggregate_energy_void_map(
             &units,
-            &actions,
+            &to_vec_some(actions),
             FIXED_PARAMS.map_size,
             5,
         );
@@ -1109,6 +1281,7 @@ mod tests {
             unit_sap_cost: 10,
             ..Default::default()
         };
+        let last_actions = to_vec_some(last_actions);
         let sap_count_maps = compute_sap_count_maps(
             &last_obs_data.my_units,
             &last_actions,
@@ -1160,6 +1333,7 @@ mod tests {
             unit_sap_cost: 10,
             ..Default::default()
         };
+        let last_actions = to_vec_some(last_actions);
         let sap_count_maps = compute_sap_count_maps(
             &last_obs_data.my_units,
             &last_actions,
@@ -1354,6 +1528,7 @@ mod tests {
             unit_sap_cost: 10,
             ..Default::default()
         };
+        let last_actions = to_vec_some(last_actions);
         let sap_count_maps = compute_sap_count_maps(
             &last_obs_data.my_units,
             &last_actions,
@@ -1395,6 +1570,6 @@ mod tests {
             (Pos::new(1, 0), 1),
         ]);
         let result = get_unit_counts_map(&units);
-        assert_eq!(result, expected_result);
+        pretty_assert_eq!(result, expected_result);
     }
 }

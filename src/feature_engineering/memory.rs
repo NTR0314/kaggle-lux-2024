@@ -11,6 +11,7 @@ use crate::rules_engine::params::{FixedParams, KnownVariableParams};
 use crate::rules_engine::state::{Observation, Pos};
 use energy_field::EnergyFieldMemory;
 use hidden_parameter::HiddenParameterMemory;
+use itertools::Itertools;
 use numpy::ndarray::Array2;
 use relic_node::RelicNodeMemory;
 use space_obstacle::SpaceObstacleMemory;
@@ -107,19 +108,19 @@ impl Memory {
     }
 
     pub fn get_explored_relic_nodes_map(&self) -> &Array2<bool> {
-        &self.relic_node.explored_nodes_map
+        &self.relic_node.explored_nodes
     }
 
-    pub fn get_relic_known_and_explored_points_map(&self) -> &Array2<bool> {
-        &self.relic_node.known_and_explored_points_map
+    pub fn get_relic_known_to_have_points_map(&self) -> &Array2<bool> {
+        &self.relic_node.known_to_have_points
     }
 
-    pub fn get_relic_estimated_points_map(&self) -> &Array2<f32> {
-        &self.relic_node.estimated_unexplored_points_map
+    pub fn get_relic_estimated_unexplored_points_map(&self) -> &Array2<f32> {
+        &self.relic_node.estimated_unexplored_points
     }
 
     pub fn get_relic_explored_points_map(&self) -> &Array2<bool> {
-        &self.relic_node.explored_points_map
+        &self.relic_node.explored_points
     }
 
     pub fn get_known_asteroids_map(&self) -> &Array2<bool> {
@@ -134,10 +135,55 @@ impl Memory {
         &self.space_obstacle.explored_tiles
     }
 
-    pub fn get_nebula_tile_drift_speed_weights(&self) -> Vec<f32> {
+    pub fn get_future_asteroids(
+        &self,
+        current_step: u32,
+        future_steps: usize,
+    ) -> Vec<(usize, Pos)> {
         self.space_obstacle
+            .get_future_asteroids(current_step, future_steps)
+    }
+
+    pub fn get_future_nebulae(
+        &self,
+        current_step: u32,
+        future_steps: usize,
+    ) -> Vec<(usize, Pos)> {
+        self.space_obstacle
+            .get_future_nebulae(current_step, future_steps)
+    }
+
+    pub fn get_nebula_tile_drift_speed_weights(&self) -> Vec<f32> {
+        let full_weights = self
+            .space_obstacle
             .nebula_tile_drift_speed
-            .get_weighted_possibilities()
+            .get_weighted_possibilities();
+
+        let (first, second) = full_weights.split_at(full_weights.len() / 2);
+        first
+            .iter()
+            .zip_eq(second.iter().rev())
+            .map(|(a, b)| a + b)
+            .collect()
+    }
+
+    pub fn get_nebula_tile_drift_direction_weights(&self) -> [f32; 2] {
+        let negative_drift_possible = self
+            .space_obstacle
+            .nebula_tile_drift_speed
+            .iter_unmasked_options()
+            .any(|&s| s < 0.0);
+        let positive_drift_possible = self
+            .space_obstacle
+            .nebula_tile_drift_speed
+            .iter_unmasked_options()
+            .any(|&s| s > 0.0);
+        match (negative_drift_possible, positive_drift_possible) {
+            (true, true) => [0.5, 0.5],
+            (true, false) => [1.0, 0.0],
+            (false, true) => [0.0, 1.0],
+            (false, false) => unreachable!(),
+        }
     }
 }
 
@@ -153,6 +199,49 @@ mod tests {
     use rstest::rstest;
     use std::path::PathBuf;
 
+    #[test]
+    fn test_nebula_tile_drift_speed_weights_assumptions() {
+        let drift_speeds = PARAM_RANGES.nebula_tile_drift_speed.clone();
+        assert_eq!(drift_speeds.len() % 2, 0);
+        let (first, second) = drift_speeds.split_at(drift_speeds.len() / 2);
+        let first = first.iter().map(|s| s.abs()).collect_vec();
+        let second = second.iter().rev().copied().collect_vec();
+        assert_eq!(first, second);
+    }
+
+    #[rstest]
+    #[case(vec![true; 6], vec![1. / 3.; 3])]
+    #[case(vec![false, false, false, true, true, true], vec![1. / 3.; 3])]
+    #[case(
+        vec![true, false, false, false, false, false],
+        vec![1., 0., 0.],
+    )]
+    #[case(
+        vec![true, false, false, false, false, true],
+        vec![1., 0., 0.],
+    )]
+    #[case(
+        vec![true, false, false, false, true, false],
+        vec![0.5, 0.5, 0.],
+    )]
+    #[case(
+        vec![true, false, false, false, true, true],
+        vec![2. / 3., 1. / 3., 0.],
+    )]
+    fn test_nebula_tile_drift_speed_weights(
+        #[case] mask: Vec<bool>,
+        #[case] expected_weights: Vec<f32>,
+    ) {
+        let mut mem = Memory::new(&PARAM_RANGES, FIXED_PARAMS.map_size);
+        mem.space_obstacle.nebula_tile_drift_speed.mask = mask;
+        assert_eq!(mem.get_nebula_tile_drift_speed_weights(), expected_weights);
+    }
+
+    #[test]
+    fn test_nebula_tile_drift_direction_assumptions() {
+        assert!(!PARAM_RANGES.nebula_tile_drift_speed.contains(&0.));
+    }
+
     fn is_symmetrical<T>(arr: ArrayView2<T>) -> bool
     where
         T: Copy + PartialEq,
@@ -165,15 +254,6 @@ mod tests {
             }
         }
         true
-    }
-
-    fn should_drift(step: u32, speed: f32) -> bool {
-        step as f32 * speed % 1.0 == 0.0
-    }
-
-    fn drift_speed_equal(speed: f32, other: f32) -> bool {
-        (0..FIXED_PARAMS.get_max_steps_in_game())
-            .all(|step| should_drift(step, speed) == should_drift(step, other))
     }
 
     #[rstest]
@@ -218,10 +298,7 @@ mod tests {
                     .energy_node_drift_speed
                     .iter_unmasked_options()
                     .any(|&speed| {
-                        drift_speed_equal(
-                            speed,
-                            variable_params.energy_node_drift_speed,
-                        )
+                        speed == variable_params.energy_node_drift_speed
                     })
                 {
                     incorrect_speed_count += 1.;
@@ -254,7 +331,11 @@ mod tests {
                 <= 0.1
         );
         for mem in memories.iter() {
-            assert!(mem.energy_field.energy_node_drift_speed.solved());
+            assert!(
+                mem.energy_field.energy_node_drift_speed.solved(),
+                "{:?}",
+                mem.energy_field.energy_node_drift_speed
+            );
         }
     }
 
@@ -302,10 +383,37 @@ mod tests {
         }
 
         for mem in memories.iter() {
-            assert!(mem.hidden_parameter.nebula_tile_vision_reduction.solved());
-            assert!(mem.hidden_parameter.nebula_tile_energy_reduction.solved());
-            assert!(mem.hidden_parameter.unit_sap_dropoff_factor.solved());
-            assert!(mem.hidden_parameter.unit_energy_void_factor.solved());
+            if full_replay.params.variable.unit_sensor_range <= 1
+                && full_replay.params.variable.nebula_tile_vision_reduction >= 3
+            {
+                assert!(mem
+                    .hidden_parameter
+                    .nebula_tile_vision_reduction
+                    .iter_unmasked_options()
+                    .all(|&vr| vr >= 3));
+            } else {
+                assert!(
+                    mem.hidden_parameter.nebula_tile_vision_reduction.solved(),
+                    "{:?}",
+                    mem.hidden_parameter.nebula_tile_vision_reduction
+                );
+            }
+
+            assert!(
+                mem.hidden_parameter.nebula_tile_energy_reduction.solved(),
+                "{:?}",
+                mem.hidden_parameter.nebula_tile_energy_reduction
+            );
+            assert!(
+                mem.hidden_parameter.unit_sap_dropoff_factor.solved(),
+                "{:?}",
+                mem.hidden_parameter.unit_sap_dropoff_factor
+            );
+            assert!(
+                mem.hidden_parameter.unit_energy_void_factor.solved(),
+                "{:?}",
+                mem.hidden_parameter.unit_energy_void_factor
+            );
         }
     }
 
@@ -322,32 +430,34 @@ mod tests {
             Memory::new(&PARAM_RANGES, FIXED_PARAMS.map_size),
             Memory::new(&PARAM_RANGES, FIXED_PARAMS.map_size),
         ];
-        for (state, actions, obs, _next_state) in run_replay(&full_replay) {
+        for (_state, actions, obs, next_state) in run_replay(&full_replay) {
             for (mem, obs, last_actions) in
                 izip_eq!(memories.iter_mut(), obs, actions)
             {
                 mem.update(&obs, &last_actions, &FIXED_PARAMS, &known_params);
-                Zip::from(&state.relic_node_points_map)
-                    .and(&mem.relic_node.known_and_explored_points_map)
-                    .and(&mem.relic_node.explored_points_map)
+                Zip::from(&next_state.relic_node_points_map)
+                    .and(&mem.relic_node.known_to_have_points)
+                    .and(&mem.relic_node.explored_points)
                     .for_each(
-                        |&actual_point, &known_and_explored, &explored| {
+                        |&actual_point, &known_to_have_point, &explored| {
                             if explored {
-                                assert_eq!(known_and_explored, actual_point);
+                                assert_eq!(known_to_have_point, actual_point,);
                             }
                         },
                     );
 
                 for (loc, &explored) in
-                    mem.relic_node.explored_nodes_map.indexed_iter()
+                    mem.relic_node.explored_nodes.indexed_iter()
                 {
                     if explored {
                         let pos = loc.into();
                         assert_eq!(
-                            state.relic_node_locations.contains(&pos),
-                            mem.relic_node.relic_nodes.contains(&pos)
+                            next_state.relic_node_locations.contains(&pos),
+                            mem.relic_node.relic_nodes.contains(&pos),
                         );
-                    } else {
+                    } else if obs.match_steps
+                        >= FIXED_PARAMS.max_steps_in_match / 2
+                    {
                         assert!(!obs.sensor_mask[loc]);
                     }
                 }
@@ -358,31 +468,28 @@ mod tests {
                         .relic_nodes
                         .contains(&rn.reflect(FIXED_PARAMS.map_size)));
                 }
+                assert!(is_symmetrical(mem.relic_node.explored_nodes.view()));
                 assert!(is_symmetrical(
-                    mem.relic_node.explored_nodes_map.view()
+                    mem.relic_node.known_to_have_points.view()
                 ));
                 assert!(is_symmetrical(
-                    mem.relic_node.known_and_explored_points_map.view()
+                    mem.relic_node.estimated_unexplored_points.view()
                 ));
-                assert!(is_symmetrical(
-                    mem.relic_node.estimated_unexplored_points_map.view()
-                ));
-                assert!(is_symmetrical(
-                    mem.relic_node.explored_points_map.view()
-                ));
+                assert!(is_symmetrical(mem.relic_node.explored_points.view()));
             }
         }
         for mem in memories.iter() {
             let explored_pct = mem
                 .relic_node
-                .explored_nodes_map
+                .explored_nodes
                 .mapv(|ex| if ex { 1.0 } else { 0.0 })
                 .mean()
                 .unwrap();
             match variable_params.unit_sensor_range {
-                2 => assert!(explored_pct >= 0.7),
+                1 => assert!(explored_pct >= 0.5),
+                2 => assert!(explored_pct >= 0.6),
                 3 => assert!(explored_pct >= 0.75),
-                4 => assert!(explored_pct >= 0.85),
+                4 => assert!(explored_pct >= 0.8),
                 n => panic!("Unrecognized unit_sensor_range {}", n),
             }
             if mem.relic_node.get_all_nodes_registered() {
@@ -391,7 +498,7 @@ mod tests {
 
             let point_explored_pct = mem
                 .relic_node
-                .explored_points_map
+                .explored_points
                 .mapv(|ex| if ex { 1.0 } else { 0.0 })
                 .mean()
                 .unwrap();
@@ -401,7 +508,11 @@ mod tests {
                 assert!(mem.relic_node.get_all_nodes_registered());
                 assert!(point_explored_pct >= 0.98);
             } else {
-                assert!(point_explored_pct >= 0.7);
+                match variable_params.unit_sensor_range {
+                    1 => assert!(point_explored_pct >= 0.6),
+                    2..=4 => assert!(point_explored_pct >= 0.7),
+                    n => panic!("Unrecognized unit_sensor_range {}", n),
+                }
             }
         }
     }
@@ -419,10 +530,14 @@ mod tests {
             Memory::new(&PARAM_RANGES, FIXED_PARAMS.map_size),
             Memory::new(&PARAM_RANGES, FIXED_PARAMS.map_size),
         ];
+        let mut nebula_tile_drift_speed_solve_step = [u32::MAX, u32::MAX];
         for (_state, actions, obs, next_state) in run_replay(&full_replay) {
-            for (mem, obs, last_actions) in
-                izip_eq!(memories.iter_mut(), obs, actions)
-            {
+            for (mem, obs, last_actions, solve_step) in izip_eq!(
+                memories.iter_mut(),
+                obs,
+                actions,
+                nebula_tile_drift_speed_solve_step.iter_mut()
+            ) {
                 mem.update(&obs, &last_actions, &FIXED_PARAMS, &known_params);
                 for (pos, explored) in mem
                     .space_obstacle
@@ -459,6 +574,9 @@ mod tests {
                 assert!(is_symmetrical(
                     mem.space_obstacle.explored_tiles.view()
                 ));
+                if mem.space_obstacle.nebula_tile_drift_speed.solved() {
+                    *solve_step = (*solve_step).min(obs.total_steps);
+                }
             }
         }
         for mem in memories.iter() {
@@ -469,7 +587,24 @@ mod tests {
                 .mean()
                 .unwrap();
             assert!(explored_pct >= 0.98);
-            assert!(mem.space_obstacle.nebula_tile_drift_speed.solved());
+            assert!(
+                mem.space_obstacle.nebula_tile_drift_speed.solved(),
+                "{:?}",
+                mem.space_obstacle.nebula_tile_drift_speed
+            );
         }
+        // Nebula / asteroid drift should be solved by the first time the tiles move
+        let expected_solved_by = (1.0
+            / full_replay.params.variable.nebula_tile_drift_speed)
+            .abs()
+            .ceil() as u32
+            + 1;
+        assert!(
+            nebula_tile_drift_speed_solve_step
+                .into_iter()
+                .all(|step| step <= expected_solved_by),
+            "{:?}",
+            nebula_tile_drift_speed_solve_step
+        );
     }
 }

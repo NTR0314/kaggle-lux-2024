@@ -1,13 +1,14 @@
 use crate::feature_engineering::memory::masked_possibilities::MaskedPossibilities;
 use crate::feature_engineering::utils::memory_error;
-use crate::rules_engine::env::estimate_vision_power_map;
+use crate::rules_engine::env::{estimate_vision_power_map, should_drift};
 use crate::rules_engine::param_ranges::ParamRanges;
 use crate::rules_engine::params::KnownVariableParams;
 use crate::rules_engine::state::{Observation, Pos};
 use itertools::Itertools;
 use numpy::ndarray::{s, Array2, Zip};
 
-/// Tracks everything known by a player about space obstacle (asteroid and nebulae) locations
+const NEGATIVE_DRIFT: [isize; 2] = [-1, 1];
+const POSITIVE_DRIFT: [isize; 2] = [1, -1];
 
 #[derive(Debug, Clone)]
 pub struct SpaceObstacleMemory {
@@ -59,9 +60,7 @@ impl SpaceObstacleMemory {
     }
 
     pub fn update(&mut self, obs: &Observation, params: &KnownVariableParams) {
-        if obs.total_steps > 0
-            && self.space_obstacles_could_move(obs.total_steps - 1)
-        {
+        if self.space_obstacles_could_have_just_moved(obs.total_steps) {
             let mut fresh_memory = Self::new_empty_space_obstacles(
                 self.nebula_tile_drift_speed.clone(),
                 self.map_size,
@@ -76,14 +75,64 @@ impl SpaceObstacleMemory {
         self.update_explored_obstacles(obs, params);
     }
 
-    fn space_obstacles_could_move(&self, step: u32) -> bool {
-        self.nebula_tile_drift_speed
-            .iter_unmasked_options()
-            .any(|&speed| step as f32 * speed % 1.0 == 0.0)
+    pub fn space_obstacles_could_have_just_moved(&self, step: u32) -> bool {
+        step > 0
+            && self
+                .nebula_tile_drift_speed
+                .iter_unmasked_options()
+                .any(|&speed| should_drift(step - 1, speed))
     }
 
-    pub fn space_obstacles_could_have_just_moved(&self, step: u32) -> bool {
-        step > 0 && self.space_obstacles_could_move(step - 1)
+    pub fn get_future_asteroids(
+        &self,
+        current_step: u32,
+        future_steps: usize,
+    ) -> Vec<(usize, Pos)> {
+        let Some(&drift_speed) = self.nebula_tile_drift_speed.get_solution()
+        else {
+            return Vec::new();
+        };
+
+        let asteroids = self
+            .known_asteroids
+            .indexed_iter()
+            .filter_map(|(xy, &has_asteroid)| {
+                has_asteroid.then_some(Pos::from(xy))
+            })
+            .collect();
+        get_future_space_objects(
+            drift_speed,
+            asteroids,
+            current_step,
+            future_steps,
+            self.map_size,
+        )
+    }
+
+    pub fn get_future_nebulae(
+        &self,
+        current_step: u32,
+        future_steps: usize,
+    ) -> Vec<(usize, Pos)> {
+        let Some(&drift_speed) = self.nebula_tile_drift_speed.get_solution()
+        else {
+            return Vec::new();
+        };
+
+        let nebulae = self
+            .known_nebulae
+            .indexed_iter()
+            .filter_map(|(xy, &has_asteroid)| {
+                has_asteroid.then_some(Pos::from(xy))
+            })
+            .collect();
+        get_future_space_objects(
+            drift_speed,
+            nebulae,
+            current_step,
+            future_steps,
+            self.map_size,
+        )
     }
 
     fn update_explored_obstacles(
@@ -91,8 +140,14 @@ impl SpaceObstacleMemory {
         obs: &Observation,
         params: &KnownVariableParams,
     ) {
-        self.update_explored_asteroids(&obs.asteroids);
-        self.update_explored_nebulae(&obs.nebulae);
+        for pos in obs.asteroids.iter() {
+            self.known_asteroids[pos.as_index()] = true;
+            self.known_asteroids[pos.reflect(self.map_size).as_index()] = true;
+        }
+        for pos in obs.nebulae.iter() {
+            self.known_nebulae[pos.as_index()] = true;
+            self.known_nebulae[pos.reflect(self.map_size).as_index()] = true;
+        }
 
         let expected_vision_power_map = estimate_vision_power_map(
             obs.get_my_units(),
@@ -110,30 +165,17 @@ impl SpaceObstacleMemory {
                         [pos.reflect(self.map_size).as_index()] = true;
                 } else if should_see
                     && !self.known_nebulae[pos.as_index()]
-                    && !self.space_obstacles_could_move(obs.total_steps - 1)
+                    && !self
+                        .space_obstacles_could_have_just_moved(obs.total_steps)
                 {
                     self.explored_tiles[pos.as_index()] = true;
-                    self.explored_tiles
-                        [pos.reflect(self.map_size).as_index()] = true;
                     self.known_nebulae[pos.as_index()] = true;
-                    self.known_nebulae[pos.reflect(self.map_size).as_index()] =
-                        true;
+
+                    let reflected = pos.reflect(self.map_size);
+                    self.explored_tiles[reflected.as_index()] = true;
+                    self.known_nebulae[reflected.as_index()] = true;
                 }
             });
-    }
-
-    fn update_explored_asteroids(&mut self, asteroids: &[Pos]) {
-        for pos in asteroids.iter() {
-            self.known_asteroids[pos.as_index()] = true;
-            self.known_asteroids[pos.reflect(self.map_size).as_index()] = true;
-        }
-    }
-
-    fn update_explored_nebulae(&mut self, nebulae: &[Pos]) {
-        for pos in nebulae.iter() {
-            self.known_nebulae[pos.as_index()] = true;
-            self.known_nebulae[pos.reflect(self.map_size).as_index()] = true;
-        }
     }
 
     fn handle_space_object_movement(
@@ -144,8 +186,6 @@ impl SpaceObstacleMemory {
         let mut not_drifting_possible = self.not_drifting_possible(step);
         let mut negative_drift_possible = self.negative_drift_possible(step);
         let mut positive_drift_possible = self.positive_drift_possible(step);
-        let negative_drift = [-1, 1];
-        let positive_drift = [1, -1];
         for (pos, observed_tile) in observed
             .explored_tiles
             .indexed_iter()
@@ -155,35 +195,38 @@ impl SpaceObstacleMemory {
                 (pos, observed.get_tile_type_at(pos.as_index()).unwrap())
             })
         {
-            if self
-                .get_tile_type_at(pos.as_index())
-                .is_some_and(|tt| tt != observed_tile)
+            if not_drifting_possible
+                && self
+                    .get_tile_type_at(pos.as_index())
+                    .is_some_and(|tt| tt != observed_tile)
             {
                 not_drifting_possible = false;
             }
 
-            if self
-                .get_tile_type_at(
-                    pos.inverted_wrapped_translate(
-                        negative_drift,
-                        self.map_size,
+            if negative_drift_possible
+                && self
+                    .get_tile_type_at(
+                        pos.inverted_wrapped_translate(
+                            NEGATIVE_DRIFT,
+                            self.map_size,
+                        )
+                        .as_index(),
                     )
-                    .as_index(),
-                )
-                .is_some_and(|tt| tt != observed_tile)
+                    .is_some_and(|tt| tt != observed_tile)
             {
                 negative_drift_possible = false;
             }
 
-            if self
-                .get_tile_type_at(
-                    pos.inverted_wrapped_translate(
-                        positive_drift,
-                        self.map_size,
+            if positive_drift_possible
+                && self
+                    .get_tile_type_at(
+                        pos.inverted_wrapped_translate(
+                            POSITIVE_DRIFT,
+                            self.map_size,
+                        )
+                        .as_index(),
                     )
-                    .as_index(),
-                )
-                .is_some_and(|tt| tt != observed_tile)
+                    .is_some_and(|tt| tt != observed_tile)
             {
                 positive_drift_possible = false;
             }
@@ -208,9 +251,9 @@ impl SpaceObstacleMemory {
             },
             1 => {
                 if negative_drift_possible {
-                    self.apply_drift(negative_drift);
+                    self.apply_drift(NEGATIVE_DRIFT);
                 } else if positive_drift_possible {
-                    self.apply_drift(positive_drift);
+                    self.apply_drift(POSITIVE_DRIFT);
                 }
             },
             2..4 => {
@@ -261,8 +304,33 @@ impl SpaceObstacleMemory {
     }
 }
 
-fn should_drift(step: u32, speed: f32) -> bool {
-    step as f32 * speed % 1.0 == 0.0
+fn get_future_space_objects(
+    drift_speed: f32,
+    space_objects: Vec<Pos>,
+    current_step: u32,
+    future_steps: usize,
+    map_size: [usize; 2],
+) -> Vec<(usize, Pos)> {
+    let drift = if drift_speed < 0.0 {
+        NEGATIVE_DRIFT
+    } else if drift_speed > 0.0 {
+        POSITIVE_DRIFT
+    } else {
+        unreachable!()
+    };
+
+    let mut result = Vec::with_capacity(space_objects.len() * future_steps);
+    for mut pos in space_objects.iter().copied() {
+        for offset in 0..future_steps {
+            let step = current_step + offset as u32;
+            if should_drift(step, drift_speed) {
+                pos = pos.wrapped_translate(drift, map_size);
+            }
+
+            result.push((offset, pos));
+        }
+    }
+    result
 }
 
 fn should_negative_drift(step: u32, speed: f32) -> bool {
@@ -339,7 +407,68 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules_engine::params::FIXED_PARAMS;
+    use pretty_assertions::assert_eq as pretty_assert_eq;
     use rstest::rstest;
+
+    #[rstest]
+    #[case(
+        0.05,
+        vec![Pos::new(10, 10)],
+        19,
+        3,
+        vec![(0, Pos::new(10, 10)), (1, Pos::new(11, 9)), (2, Pos::new(11, 9))]
+    )]
+    #[case(
+        0.05,
+        vec![Pos::new(10, 10)],
+        21,
+        2,
+        vec![(0, Pos::new(10, 10)), (1, Pos::new(10, 10))]
+    )]
+    #[case(
+        -0.5,
+        vec![Pos::new(10, 10)],
+        0,
+        3,
+        vec![(0, Pos::new(9, 11)), (1, Pos::new(9, 11)), (2, Pos::new(8, 12))]
+    )]
+    #[case(
+        -0.5,
+        vec![Pos::new(10, 10), Pos::new(0, 0)],
+        1,
+        5,
+        vec![
+            (0, Pos::new(10, 10)),
+            (1, Pos::new(9, 11)),
+            (2, Pos::new(9, 11)),
+            (3, Pos::new(8, 12)),
+            (4, Pos::new(8, 12)),
+            (0, Pos::new(0, 0)),
+            (1, Pos::new(23, 1)),
+            (2, Pos::new(23, 1)),
+            (3, Pos::new(22, 2)),
+            (4, Pos::new(22, 2)),
+        ]
+    )]
+    fn test_get_future_space_objects(
+        #[case] drift_speed: f32,
+        #[case] space_objects: Vec<Pos>,
+        #[case] current_step: u32,
+        #[case] future_steps: usize,
+        #[case] mut expected_result: Vec<(usize, Pos)>,
+    ) {
+        let mut result = get_future_space_objects(
+            drift_speed,
+            space_objects,
+            current_step,
+            future_steps,
+            FIXED_PARAMS.map_size,
+        );
+        result.sort();
+        expected_result.sort();
+        pretty_assert_eq!(result, expected_result);
+    }
 
     #[rstest]
     // Basic single impossible option cases
@@ -395,18 +524,17 @@ mod tests {
         );
     }
 
-    #[rstest]
-    #[case(Pos::new(0, 0))]
-    #[case(Pos::new(0, 8))]
-    #[case(Pos::new(1, 9))]
-    #[case(Pos::new(3, 5))]
-    #[case(Pos::new(7, 4))]
-    #[case(Pos::new(9, 9))]
-    fn test_apply_drift(#[case] pos: Pos) {
+    #[test]
+    fn test_apply_drift() {
         let base = 2;
         let special = 5;
         let map_size = [10, 10];
-        for drift in [[-1, 1], [1, -1]] {
+        let [w, h] = map_size;
+        for (pos, drift) in (0..w)
+            .cartesian_product(0..h)
+            .map(Pos::from)
+            .cartesian_product([[-1, 1], [1, -1]])
+        {
             let mut arr = Array2::from_elem(map_size, base);
             arr[pos.as_index()] = special;
             apply_drift(&mut arr, drift);

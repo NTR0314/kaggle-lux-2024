@@ -22,9 +22,18 @@ where
     encoded
 }
 
+#[cfg(debug_assertions)]
 pub fn memory_error(msg: &str) {
-    // TODO: For game-time build, don't panic
-    panic!("{}", msg);
+    panic!("{}", format_memory_error(msg));
+}
+
+#[cfg(not(debug_assertions))]
+pub fn memory_error(msg: &str) {
+    eprintln!("{}", format_memory_error(msg));
+}
+
+fn format_memory_error(msg: &str) -> String {
+    format!("memory error - {}\n", msg)
 }
 
 #[cfg(test)]

@@ -1,6 +1,7 @@
 import datetime
 import logging
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, TypeVar
@@ -34,23 +35,33 @@ def count_trainable_params(model: nn.Module) -> int:
 
 
 def init_logger(logger: logging.Logger) -> None:
+    info_file_handler = logging.FileHandler("info.log", mode="a")
+    info_file_handler.setLevel(logging.INFO)
+    logger.addHandler(info_file_handler)
+
     coloredlogs.install(
         level=logging.INFO,
         logger=logger,
         fmt="%(asctime)s %(name)s %(levelname)s %(message)s",
+        stream=sys.stdout,
     )
 
 
 def init_train_dir(
     name: str,
     cfg_dict: dict[str, Any],
+    checkpoint_dir: Path | None,
 ) -> None:
+    if checkpoint_dir:
+        os.chdir(checkpoint_dir)
+        return
+
     start_time = datetime.datetime.now()
     train_dir = (
         TRAIN_OUTPUTS_DIR
         / name
         / start_time.strftime("%Y_%m_%d")
-        / start_time.strftime("%H_%M")
+        / start_time.strftime("%H_%M_%S")
     )
     train_dir.mkdir(parents=True, exist_ok=True)
     os.chdir(train_dir)
@@ -63,8 +74,9 @@ def save_checkpoint(
     logger: logging.Logger,
 ) -> None:
     checkpoint_name = f"checkpoint_{str(train_state.step).zfill(6)}"
-    full_path = f"{checkpoint_name}.pt"
-    weights_path = f"{checkpoint_name}_weights.pt"
+    base_path = Path(os.getcwd())
+    full_path = base_path / f"{checkpoint_name}.pt"
+    weights_path = base_path / f"{checkpoint_name}_weights.pt"
     torch.save(
         {
             "step": train_state.step,
@@ -93,6 +105,7 @@ def save_checkpoint(
 class WandbInitConfig:
     project: str
     group: str
+    config_dict: dict[str, Any]
 
 
 def load_checkpoint(
@@ -115,7 +128,9 @@ def load_checkpoint(
         wandb.init(
             project=wandb_init_config.project,
             group=wandb_init_config.group,
+            config=wandb_init_config.config_dict,
             id=run_id,
+            resume="must",
         )
 
 

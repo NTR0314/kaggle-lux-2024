@@ -1,6 +1,6 @@
 max_updates: null
 optimizer_kwargs:
-  lr: 8e-5
+  lr: 1e-4
   eps: 0.000_3
 lr_schedule:
   steps: 150_000
@@ -18,7 +18,6 @@ loss_coefficients:
   policy: 1.0
   value: 0.5
   entropy: 1e-4
-  # TODO: tune teacher loss decay
   # teacher_policy and teacher_value don't have any effect unless
   # teacher_path is set above
   teacher_policy:

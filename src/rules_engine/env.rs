@@ -1,7 +1,9 @@
 use super::action::Action;
 use super::game_stats::StepStats;
 use super::params::{FixedParams, VariableParams, FIXED_PARAMS, P};
-use super::state::{EnergyNode, GameResult, Observation, Pos, State, Unit};
+use super::state::{
+    EnergyNode, GameResult, Observation, Pos, RelicSpawn, State, Unit,
+};
 use itertools::Itertools;
 use numpy::ndarray::{s, Array2, Array3, ArrayView2, ArrayView3, Axis, Zip};
 use rand::distributions::{Distribution, Uniform};
@@ -12,6 +14,7 @@ use TerminationMode::{FinalStep, ThirdMatchWin};
 
 pub const ENERGY_VOID_DELTAS: [[isize; 2]; 4] =
     [[-1, 0], [1, 0], [0, -1], [0, 1]];
+pub const UNIT_VISION_BONUS: i32 = 10;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TerminationMode {
@@ -49,6 +52,11 @@ pub fn step(
         state.units = [Vec::new(), Vec::new()];
     }
     remove_dead_units(&mut state.units);
+    spawn_relic_nodes(
+        state,
+        FIXED_PARAMS.relic_config_size,
+        FIXED_PARAMS.map_size,
+    );
     let actions = get_relevant_actions(actions, &state.units);
     let (noop_count, move_count, sap_count) = move_units(
         &mut state.units,
@@ -165,6 +173,37 @@ fn remove_dead_units(units: &mut [Vec<Unit>; P]) {
     units[1].retain(|u| u.alive());
 }
 
+fn spawn_relic_nodes(
+    state: &mut State,
+    relic_config_size: usize,
+    map_size: [usize; 2],
+) {
+    let mut spawn_schedule = mem::take(&mut state.relic_node_spawn_schedule);
+    spawn_schedule.retain(|rs| {
+        !maybe_spawn_relic_node(state, rs, relic_config_size, map_size)
+    });
+    state.relic_node_spawn_schedule = spawn_schedule;
+}
+
+fn maybe_spawn_relic_node(
+    state: &mut State,
+    relic_spawn: &RelicSpawn,
+    relic_config_size: usize,
+    map_size: [usize; 2],
+) -> bool {
+    if state.total_steps < relic_spawn.spawn_step {
+        false
+    } else {
+        state.add_relic_node(
+            relic_spawn.pos,
+            &relic_spawn.config,
+            relic_config_size,
+            map_size,
+        );
+        true
+    }
+}
+
 fn get_relevant_actions(
     actions: &[Vec<Action>; P],
     units: &[Vec<Unit>; P],
@@ -213,15 +252,15 @@ fn move_units(
         if unit.energy < params.unit_move_cost {
             continue;
         };
-        // This behavior is almost certainly a bug in the main simulator
-        if deltas[0] < 0 || deltas[1] < 0 {
-            let wrapped_pos = unit.pos.wrapped_translate(deltas, map_size);
-            if asteroid_mask[wrapped_pos.as_index()] {
-                continue;
-            }
-        };
         let new_pos = unit.pos.bounded_translate(deltas, map_size);
-        if asteroid_mask[new_pos.as_index()] {
+        // This is_blocked behavior seems to be a small edge-case bug in the main simulator
+        let is_blocked = if deltas[0] < 0 || deltas[1] < 0 {
+            let wrapped_pos = unit.pos.wrapped_translate(deltas, map_size);
+            asteroid_mask[wrapped_pos.as_index()]
+        } else {
+            asteroid_mask[new_pos.as_index()]
+        };
+        if is_blocked {
             continue;
         }
         unit.pos = new_pos;
@@ -564,11 +603,13 @@ pub fn get_spawn_position(
 
 pub fn just_respawned(
     unit: &Unit,
+    match_steps: u32,
     team_id: usize,
     fixed_params: &FixedParams,
 ) -> bool {
-    let spawn_pos = get_spawn_position(team_id, fixed_params.map_size);
-    unit.energy == fixed_params.init_unit_energy && unit.pos == spawn_pos
+    match_steps.saturating_sub(1) % fixed_params.spawn_rate == 0
+        && unit.energy == fixed_params.init_unit_energy
+        && unit.pos == get_spawn_position(team_id, fixed_params.map_size)
 }
 
 pub fn estimate_vision_power_map(
@@ -610,23 +651,21 @@ fn compute_vision_power_map(
 ) -> Array3<i32> {
     let [width, height] = map_size;
     let mut vision_power_map = Array3::zeros((units.len(), width, height));
-    for ((team, x, y), v) in units
-        .iter()
-        .enumerate()
-        .flat_map(|(t, team_units)| {
-            team_units.iter().map(move |u| (t, u.pos.x, u.pos.y))
-        })
-        .cartesian_product(0..=unit_sensor_range)
-    {
-        let range = unit_sensor_range - v;
-        vision_power_map
-            .slice_mut(s![
-                team,
-                x.saturating_sub(range)..(x + range + 1).min(width),
-                y.saturating_sub(range)..(y + range + 1).min(height),
-            ])
-            .iter_mut()
-            .for_each(|value| *value += 1);
+    for (team, x, y) in units.iter().enumerate().flat_map(|(t, team_units)| {
+        team_units.iter().map(move |u| (t, u.pos.x, u.pos.y))
+    }) {
+        for v in 0..=unit_sensor_range {
+            let range = unit_sensor_range - v;
+            vision_power_map
+                .slice_mut(s![
+                    team,
+                    x.saturating_sub(range)..(x + range + 1).min(width),
+                    y.saturating_sub(range)..(y + range + 1).min(height),
+                ])
+                .iter_mut()
+                .for_each(|value| *value += 1);
+        }
+        vision_power_map[[team, x, y]] += UNIT_VISION_BONUS;
     }
     for (x, y) in nebulae.iter().map(|n| (n.x, n.y)) {
         vision_power_map
@@ -645,9 +684,7 @@ fn move_space_objects(
     params: &VariableParams,
     fixed_params: &FixedParams,
 ) -> Option<Array2<i32>> {
-    if state.total_steps as f32 * params.nebula_tile_drift_speed % 1.0 == 0.0
-        && params.nebula_tile_drift_speed != 0.0
-    {
+    if should_drift(state.total_steps, params.nebula_tile_drift_speed) {
         let deltas = [
             params.nebula_tile_drift_speed.signum() as isize,
             -params.nebula_tile_drift_speed.signum() as isize,
@@ -657,7 +694,7 @@ fn move_space_objects(
         }
     }
 
-    if state.total_steps as f32 * params.energy_node_drift_speed % 1.0 == 0.0 {
+    if should_drift(state.total_steps, params.energy_node_drift_speed) {
         let energy_node_deltas = energy_node_deltas.unwrap_or_else(|| {
             get_random_energy_node_deltas(rng, state.energy_nodes.len(), params)
         });
@@ -678,6 +715,13 @@ fn move_space_objects(
     } else {
         None
     }
+}
+
+#[inline]
+pub fn should_drift(step: u32, speed: f32) -> bool {
+    let step = step as f32;
+    let speed = speed.abs();
+    ((step - 1.) * speed).rem_euclid(1.) > (step * speed).rem_euclid(1.)
 }
 
 fn get_random_energy_node_deltas(
@@ -846,25 +890,25 @@ fn get_observation(
         obs.units[opp] = state.units[opp]
             .iter()
             .filter(|u| obs.sensor_mask[u.pos.as_index()])
-            .cloned()
+            .copied()
             .collect();
         obs.asteroids = state
             .asteroids
             .iter()
-            .copied()
             .filter(|a| obs.sensor_mask[a.as_index()])
+            .copied()
             .collect();
         obs.nebulae = state
             .nebulae
             .iter()
-            .copied()
             .filter(|a| obs.sensor_mask[a.as_index()])
+            .copied()
             .collect();
         obs.relic_node_locations = state
             .relic_node_locations
             .iter()
-            .copied()
             .filter(|a| obs.sensor_mask[a.as_index()])
+            .copied()
             .collect();
     }
     observations
@@ -915,6 +959,62 @@ mod tests {
             FinalStep,
             None,
         );
+    }
+
+    #[test]
+    fn test_spawn_relic_nodes() {
+        let map_size = [5, 5];
+        let relic_config_size = 3;
+        let orig_spawn_schedule = vec![
+            RelicSpawn::new(
+                10,
+                Pos::new(0, 0),
+                arr2(&[[true; 3], [true, true, false], [false, false, true]]),
+            ),
+            RelicSpawn::new(
+                10,
+                Pos::new(3, 3),
+                arr2(&[[false; 3], [true, true, false], [true, true, false]]),
+            ),
+            RelicSpawn::new(
+                11,
+                Pos::new(1, 1),
+                Array2::from_elem([relic_config_size; 2], true),
+            ),
+            RelicSpawn::new(
+                11,
+                Pos::new(2, 2),
+                Array2::from_elem([relic_config_size; 2], true),
+            ),
+        ];
+        let mut state = State {
+            relic_node_locations: Vec::new(),
+            relic_node_points_map: Array2::default(map_size),
+            relic_node_spawn_schedule: orig_spawn_schedule.clone(),
+            total_steps: 9,
+            ..Default::default()
+        };
+
+        spawn_relic_nodes(&mut state, relic_config_size, map_size);
+        assert_eq!(state.relic_node_spawn_schedule, orig_spawn_schedule);
+        assert!(state.relic_node_locations.is_empty());
+        assert!(!state.relic_node_points_map.iter().any(|&p| p));
+
+        state.total_steps = 10;
+        spawn_relic_nodes(&mut state, relic_config_size, map_size);
+        assert_eq!(&state.relic_node_spawn_schedule, &orig_spawn_schedule[2..]);
+        assert_eq!(
+            state.relic_node_locations,
+            vec![Pos::new(0, 0), Pos::new(3, 3)]
+        );
+        let expected_points_map = arr2(&[
+            [true, false, false, false, false],
+            [false, true, false, false, false],
+            [false, false, false, false, false],
+            [false, false, true, true, false],
+            [false, false, true, true, false],
+        ]);
+        assert_eq!(state.relic_node_points_map, expected_points_map);
     }
 
     #[test]
@@ -1426,20 +1526,24 @@ mod tests {
     }
 
     #[rstest]
-    // Team 0 only succeeds at (0, 0) with 100 energy
-    #[case(Unit::with_pos_and_energy(Pos::new(0, 0), 100), 0, true)]
-    #[case(Unit::with_pos_and_energy(Pos::new(0, 1), 100), 0, false)]
-    #[case(Unit::with_pos_and_energy(Pos::new(0, 0), 101), 0, false)]
+    // Team 0 only succeeds at (0, 0) with 100 energy at a proper step
+    #[case(Unit::with_pos_and_energy(Pos::new(0, 0), 100), 1, 0, true)]
+    #[case(Unit::with_pos_and_energy(Pos::new(0, 0), 100), 2, 0, false)]
+    #[case(Unit::with_pos_and_energy(Pos::new(0, 1), 100), 1, 0, false)]
+    #[case(Unit::with_pos_and_energy(Pos::new(0, 0), 101), 1, 0, false)]
     // Team 1 only succeeds at (23, 23) with 100 energy
-    #[case(Unit::with_pos_and_energy(Pos::new(23, 23), 100), 1, true)]
-    #[case(Unit::with_pos_and_energy(Pos::new(22, 23), 100), 1, false)]
-    #[case(Unit::with_pos_and_energy(Pos::new(23, 23), 99), 1, false)]
+    #[case(Unit::with_pos_and_energy(Pos::new(23, 23), 100), 1, 1, true)]
+    #[case(Unit::with_pos_and_energy(Pos::new(23, 23), 100), 3, 1, false)]
+    #[case(Unit::with_pos_and_energy(Pos::new(22, 23), 100), 1, 1, false)]
+    #[case(Unit::with_pos_and_energy(Pos::new(23, 23), 99), 1, 1, false)]
     fn test_just_respawned(
         #[case] unit: Unit,
+        #[case] match_steps: u32,
         #[case] team_id: usize,
         #[case] expected_result: bool,
     ) {
-        let respawned = just_respawned(&unit, team_id, &FIXED_PARAMS);
+        let respawned =
+            just_respawned(&unit, match_steps, team_id, &FIXED_PARAMS);
         assert_eq!(respawned, expected_result);
     }
 
@@ -1459,13 +1563,13 @@ mod tests {
             [
                 [0, 0, 0, 0, 0],
                 [0, 1, 1, 1, 0],
-                [0, 1, 2, 1, 0],
+                [0, 1, 12, 1, 0],
                 [0, 1, 1, 1, 0],
                 [0, 0, 0, 0, 0],
             ],
             [
                 [1, 1, 1, 0, 0],
-                [1, 2, 1, 0, 0],
+                [1, 12, 1, 0, 0],
                 [1, 1, 1, 0, 0],
                 [0, 0, 0, 0, 0],
                 [0, 0, 0, 0, 0],
@@ -1495,8 +1599,8 @@ mod tests {
             vec![Unit::with_pos(Pos::new(2, 2))],
         ];
         let expected_result = arr3(&[
-            [[2, 1, 0], [1, 1, 0], [0, 0, 0]],
-            [[0, 0, 0], [0, 1, 1], [0, 1, 2]],
+            [[12, 1, 0], [1, 1, 0], [0, 0, 0]],
+            [[0, 0, 0], [0, 1, 1], [0, 1, 12]],
         ]);
         assert_eq!(
             compute_vision_power_map_from_params(
@@ -1532,15 +1636,15 @@ mod tests {
         let expected_result = arr3(&[
             [
                 [1, 1, 1, 0, 0],
-                [1, 3 - 5, 2, 1, 0],
-                [1, 2, 3, 1 - 5, 0],
+                [1, 13 - 5, 2, 1, 0],
+                [1, 2, 13, 1 - 5, 0],
                 [0, 1, 1, 1, 0],
                 [0, 0, 0, 0, 0],
             ],
             [
                 [0, 0, 0, 0, 0],
                 [0, 2 - 5, 2, 2, 0],
-                [0, 2, 4, 2 - 5, 0],
+                [0, 2, 24, 2 - 5, 0],
                 [0, 2, 2, 2, 0],
                 [0, 0, 0, 0, 0],
             ],
@@ -1589,6 +1693,7 @@ mod tests {
                 // Stops at edge of board
                 EnergyNode::new_at(Pos::new(1, 2)),
             ],
+            total_steps: 100,
             ..Default::default()
         };
         let energy_node_deltas = vec![[-3, 4], [3, 3]];
@@ -2010,7 +2115,8 @@ mod tests {
             .zip_eq(
                 player_observations[1..]
                     .iter()
-                    .map(|obs| Some(obs.clone()))
+                    .cloned()
+                    .map(Option::from)
                     .chain(once(None)),
             )
         {

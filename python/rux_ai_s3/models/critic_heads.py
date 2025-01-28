@@ -27,7 +27,7 @@ class BaseCriticHead(nn.Module, ABC):
             out_channels=1,
             kernel_size=1,
         )
-        # self._init_weights()  # noqa: ERA001
+        self._init_weights()
 
     def _init_weights(self) -> None:
         orthogonal_initialization_(self.conv_base, strict=True)
@@ -88,8 +88,8 @@ class ZeroSumCriticHead(BaseCriticHead):
 
     def postprocess_value(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Assumes both opposing player observations are passed in at once. \
-        Expects input of shape (batch * 2 [n_players],) \
+        Assumes both opposing player observations are passed in at once.
+        Expects input of shape (batch * 2 [n_players],)
         Returns output of shape (batch * 2 [n_players],)
         """
         return F.softmax(x.view(-1, 2), dim=-1).view(-1) * 2.0 - 1.0

@@ -70,7 +70,7 @@ CPU: Final[torch.device] = torch.device("cpu")
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-logger = logging.getLogger(NAME.upper())
+logger = logging.getLogger()
 
 
 class UserArgs(BaseModel):
@@ -100,6 +100,13 @@ class UserArgs(BaseModel):
             return self.config
 
         return DEFAULT_CONFIG_FILE
+
+    @property
+    def checkpoint_dir(self) -> Path | None:
+        if self.checkpoint is None:
+            return None
+
+        return self.checkpoint.parent
 
     @field_validator("checkpoint")
     @classmethod
@@ -177,9 +184,9 @@ class TeacherLossSchedule(BaseModel):
 
 
 class LossCoefficients(BaseModel):
-    policy: float
-    value: float
-    entropy: float
+    policy: Annotated[float, Field(ge=0.0, le=1.0)]
+    value: Annotated[float, Field(ge=0.0, le=1.0)]
+    entropy: Annotated[float, Field(ge=0.0, le=1e-3)]
     teacher_policy: TeacherLossSchedule
     teacher_value: TeacherLossSchedule
 
@@ -187,6 +194,20 @@ class LossCoefficients(BaseModel):
         extra="forbid",
         frozen=True,
     )
+
+    def get_weighted_loss_coefficients(
+        self, step: int
+    ) -> tuple[float, float, float, float, float]:
+        teacher_policy = self.teacher_policy.get_coefficient(step)
+        teacher_value = self.teacher_value.get_coefficient(step)
+        total = self.policy + self.value + self.entropy + teacher_policy + teacher_value
+        return (
+            self.policy / total,
+            self.value / total,
+            self.entropy / total,
+            teacher_policy / total,
+            teacher_value / total,
+        )
 
 
 class PPOConfig(TrainConfig):
@@ -365,10 +386,10 @@ def main() -> None:
     if args.release:
         assert_release_build()
 
-    init_logger(logger=logger)
-    logger.info("Loading config from %s", args.config_file)
     cfg = load_from_yaml(PPOConfig, args.config_file)
-    init_train_dir(NAME, cfg.model_dump())
+    init_train_dir(NAME, cfg.model_dump(), checkpoint_dir=args.checkpoint_dir)
+    init_logger(logger=logger)
+    logger.info("Loaded config from %s", args.config_file)
     env = ParallelEnv.from_config(cfg.env_config)
     model = build_model(env, cfg.rl_model_config).to(cfg.device).train()
     if args.model_weights:
@@ -401,6 +422,7 @@ def main() -> None:
             WandbInitConfig(
                 project=PROJECT_NAME,
                 group=NAME,
+                config_dict=cfg.model_dump(),
             )
             if args.release
             else None
@@ -514,9 +536,17 @@ def train_step(
     scalar_stats["env_steps_per_second"] = (
         cfg.env_config.n_envs * cfg.steps_per_update / total_time
     )
-    scalar_stats["data_collection_time"] = data_collection_time
-    scalar_stats["train_time"] = train_time
-    scalar_stats["total_time"] = total_time
+    scalar_stats["update_data_collection_time"] = data_collection_time
+    scalar_stats["update_train_time"] = train_time
+    scalar_stats["update_total_time"] = total_time
+    assert experience.reward.shape[-1] == 2
+    nonzero_reward = experience.reward[experience.reward != 0.0]
+    if len(nonzero_reward) > 0:
+        nonzero_reward = nonzero_reward.reshape(-1, 2)
+        scalar_stats["mean_nonzero_reward"] = nonzero_reward.mean().item()
+        scalar_stats["p1_mean_nonzero_reward"] = nonzero_reward[..., 0].mean().item()
+        scalar_stats["p2_mean_nonzero_reward"] = nonzero_reward[..., 1].mean().item()
+
     log_results(
         train_state.step,
         scalar_stats,
@@ -547,10 +577,13 @@ def collect_trajectories(
         last_out = env.last_out
         stacked_obs = TorchObs.from_numpy(env.get_frame_stacked_obs(), cfg.device)
         action_info = TorchActionInfo.from_numpy(last_out.action_info, cfg.device)
-        model_out = model(
-            obs=stacked_obs.flatten(start_dim=0, end_dim=1),
-            action_info=action_info.flatten(start_dim=0, end_dim=1),
-        )
+        with torch.autocast(
+            device_type="cuda", dtype=torch.float16, enabled=cfg.use_mixed_precision
+        ):
+            model_out = model(
+                obs=stacked_obs.flatten(start_dim=0, end_dim=1),
+                action_info=action_info.flatten(start_dim=0, end_dim=1),
+            )
 
         batch_obs.append(stacked_obs.to_device(CPU))
         batch_action_info.append(action_info.to_device(CPU))
@@ -559,6 +592,7 @@ def collect_trajectories(
         batch_done.append(last_out.done[:, None].repeat(2, axis=1))
         if step < cfg.steps_per_update:
             env.step(model_out.to_player_env_actions(last_out.action_info.unit_indices))
+            # TODO: Stats.merge
             stats = env.last_out.stats or stats
 
     experience = ExperienceBatch.from_lists(
@@ -625,8 +659,6 @@ def update_model_on_batch(
     returns: torch.Tensor,
     cfg: PPOConfig,
 ) -> dict[str, float]:
-    # NB: Batch of observations is random, with no association between
-    # trajectories, games, and players
     with torch.autocast(
         device_type="cuda", dtype=torch.float16, enabled=cfg.use_mixed_precision
     ):
@@ -654,30 +686,34 @@ def update_model_on_batch(
             .mean()
             .item()
         )
+        (
+            policy_coefficient,
+            value_coefficient,
+            entropy_coefficient,
+            teacher_policy_coefficient,
+            teacher_value_coefficient,
+        ) = cfg.loss_coefficients.get_weighted_loss_coefficients(train_state.step)
         policy_loss = (
             compute_pg_loss(
                 advantages,
                 action_probability_ratio,
                 cfg.clip_coefficient,
             )
-            * cfg.loss_coefficients.policy
+            * policy_coefficient
         )
         value_loss = (
             compute_value_loss(
                 new_out.value,
                 returns,
             )
-            * cfg.loss_coefficients.value
+            * value_coefficient
         )
         negative_entropy = compute_entropy_loss(
             new_out.main_log_probs,
             new_out.sap_log_probs,
             units_mask=experience.action_info.units_mask,
         )
-        entropy_loss = negative_entropy * cfg.loss_coefficients.entropy
-        teacher_policy_coefficient = (
-            cfg.loss_coefficients.teacher_policy.get_coefficient(train_state.step)
-        )
+        entropy_loss = negative_entropy * entropy_coefficient
         teacher_policy_loss = (
             (
                 compute_teacher_kl_loss(
@@ -691,9 +727,6 @@ def update_model_on_batch(
             )
             if train_state.teacher_model
             else torch.zeros_like(policy_loss)
-        )
-        teacher_value_coefficient = cfg.loss_coefficients.teacher_value.get_coefficient(
-            train_state.step
         )
         teacher_value_loss = (
             (
