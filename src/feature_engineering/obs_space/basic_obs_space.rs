@@ -202,19 +202,19 @@ fn write_temporal_spatial_out(
                     params.unit_sensor_range,
                 );
                 // Remove unit vision bonus
-                obs.get_my_units().iter().for_each(|unit| {
+                for unit in obs.get_my_units() {
                     estimated_vision_power_map[unit.pos.as_index()] -=
-                        UNIT_VISION_BONUS
-                });
+                        UNIT_VISION_BONUS;
+                }
                 // Pessimistically estimate nebula tile vision reduction
                 let nebula_vision_cost = mem
                     .iter_unmasked_nebula_tile_vision_reduction_options()
                     .max()
                     .unwrap();
-                obs.nebulae.iter().for_each(|nebula| {
+                for nebula in &obs.nebulae {
                     estimated_vision_power_map[nebula.as_index()] -=
-                        nebula_vision_cost
-                });
+                        nebula_vision_cost;
+                }
                 Zip::from(&mut slice)
                     .and(&estimated_vision_power_map)
                     .and(&obs.sensor_mask)
@@ -279,10 +279,10 @@ fn write_nontemporal_spatial_out(
             DistanceFromSpawn => {
                 let spawn_pos =
                     get_spawn_position(obs.team_id, FIXED_PARAMS.map_size);
-                slice.indexed_iter_mut().for_each(|(xy, out)| {
+                for (xy, out) in slice.indexed_iter_mut() {
                     *out = spawn_pos.manhattan_distance(xy.into()) as f32
                         / MANHATTAN_DISTANCE_NORM;
-                });
+                }
             },
             MyUnitCanMove => {
                 write_units_have_enough_energy_counts(
@@ -344,9 +344,9 @@ fn write_nontemporal_spatial_out(
                     *out = if explored { 1.0 } else { 0.0 }
                 }),
             RelicNode => {
-                mem.get_relic_nodes()
-                    .iter()
-                    .for_each(|r| slice[r.as_index()] = 1.0);
+                for r in mem.get_relic_nodes() {
+                    slice[r.as_index()] = 1.0
+                }
             },
             RelicNodeExplored => Zip::from(&mut slice)
                 .and(mem.get_explored_relic_nodes_map())
@@ -391,20 +391,20 @@ fn write_nontemporal_spatial_out(
     {
         match sf {
             AsteroidFuture => {
-                mem.get_future_asteroids(obs.total_steps, FUTURE_FRAMES)
-                    .into_iter()
-                    .for_each(|(step, pos)| {
-                        let [x, y] = pos.as_index();
-                        slice[[step, x, y]] = 1.0;
-                    });
+                for (step, pos) in
+                    mem.get_future_asteroids(obs.total_steps, FUTURE_FRAMES)
+                {
+                    let [x, y] = pos.as_index();
+                    slice[[step, x, y]] = 1.0;
+                }
             },
             NebulaFuture => {
-                mem.get_future_nebulae(obs.total_steps, FUTURE_FRAMES)
-                    .into_iter()
-                    .for_each(|(step, pos)| {
-                        let [x, y] = pos.as_index();
-                        slice[[step, x, y]] = 1.0;
-                    });
+                for (step, pos) in
+                    mem.get_future_nebulae(obs.total_steps, FUTURE_FRAMES)
+                {
+                    let [x, y] = pos.as_index();
+                    slice[[step, x, y]] = 1.0;
+                }
             },
         }
     }
@@ -529,30 +529,27 @@ fn write_nontemporal_global_out(
             },
         }
     }
-    nontemporal_global_out
-        .iter_mut()
-        .zip_eq(global_result)
-        .for_each(|(out, v)| *out = v);
+    for (out, v) in nontemporal_global_out.iter_mut().zip_eq(global_result) {
+        *out = v
+    }
 }
 
 fn write_alive_unit_counts(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
-    units
-        .iter()
-        .filter(|u| u.alive())
-        .for_each(|u| slice[u.pos.as_index()] += 1. / UNIT_COUNT_NORM);
+    for u in units.iter().filter(|u| u.alive()) {
+        slice[u.pos.as_index()] += 1. / UNIT_COUNT_NORM
+    }
 }
 
 fn write_unit_energies(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
-    units.iter().filter(|u| u.alive()).for_each(|u| {
+    for u in units.iter().filter(|u| u.alive()) {
         slice[u.pos.as_index()] += u.energy as f32 / UNIT_ENERGY_NORM
-    });
+    }
 }
 
 fn write_dead_unit_counts(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
-    units
-        .iter()
-        .filter(|u| !u.alive())
-        .for_each(|u| slice[u.pos.as_index()] += 1. / UNIT_COUNT_NORM);
+    for u in units.iter().filter(|u| !u.alive()) {
+        slice[u.pos.as_index()] += 1. / UNIT_COUNT_NORM
+    }
 }
 
 fn write_units_have_enough_energy_counts(
@@ -560,14 +557,13 @@ fn write_units_have_enough_energy_counts(
     units: &[Unit],
     energy: i32,
 ) {
-    units
-        .iter()
-        .filter(|u| u.energy >= energy)
-        .for_each(|u| slice[u.pos.as_index()] += 1. / UNIT_COUNT_NORM);
+    for u in units.iter().filter(|u| u.energy >= energy) {
+        slice[u.pos.as_index()] += 1. / UNIT_COUNT_NORM
+    }
 }
 
 fn write_unit_energy_min(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
-    units.iter().filter(|u| u.alive()).for_each(|u| {
+    for u in units.iter().filter(|u| u.alive()) {
         let cur_val = slice[u.pos.as_index()];
         let new_val =
             u.energy as f32 / UNIT_ENERGY_NORM + UNIT_ENERGY_MIN_BASELINE;
@@ -576,14 +572,14 @@ fn write_unit_energy_min(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
         } else {
             cur_val.min(new_val)
         }
-    });
+    }
 }
 
 fn write_unit_energy_max(mut slice: ArrayViewMut2<f32>, units: &[Unit]) {
-    units.iter().filter(|u| u.alive()).for_each(|u| {
+    for u in units.iter().filter(|u| u.alive()) {
         slice[u.pos.as_index()] =
             slice[u.pos.as_index()].max(u.energy as f32 / UNIT_ENERGY_NORM);
-    });
+    }
 }
 
 fn discretize_team_wins(wins: u32) -> [f32; 3] {

@@ -100,11 +100,13 @@ fn write_team_actions(
                 },
             }
         }
-        action_mask
+        for (out, v) in action_mask
             .index_axis_mut(Axis(0), unit.id)
             .iter_mut()
             .zip_eq(unit_action_mask)
-            .for_each(|(out, v)| *out = v);
+        {
+            *out = v;
+        }
     }
 }
 

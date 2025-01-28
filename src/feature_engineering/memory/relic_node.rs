@@ -66,9 +66,9 @@ impl RelicNodeMemory {
     fn prepare_for_new_relic_nodes_to_spawn(&mut self) {
         self.all_match_nodes_registered = false;
         self.explored_nodes.fill(false);
-        self.relic_nodes
-            .iter()
-            .for_each(|node| self.explored_nodes[node.as_index()] = true);
+        for node in &self.relic_nodes {
+            self.explored_nodes[node.as_index()] = true
+        }
         self.explored_points.assign(&self.known_to_have_points);
     }
 
@@ -184,14 +184,14 @@ impl RelicNodeMemory {
                 .count();
         if unaccounted_new_points == 0 {
             if self.all_match_nodes_have_spawned(obs) {
-                frontier_locations.into_iter().for_each(|pos| {
+                for pos in frontier_locations {
                     self.set_known_points(pos, false);
-                });
+                }
             }
         } else if unaccounted_new_points == frontier_locations.len() {
-            frontier_locations.into_iter().for_each(|pos| {
+            for pos in frontier_locations {
                 self.set_known_points(pos, true);
-            });
+            }
         } else if unaccounted_new_points > frontier_locations.len() {
             panic!(
                 "unaccounted_new_points {} > frontier_locations.len() {}",
@@ -201,7 +201,7 @@ impl RelicNodeMemory {
         } else {
             let mean_points =
                 unaccounted_new_points as f32 / frontier_locations.len() as f32;
-            frontier_locations.into_iter().for_each(|pos| {
+            for pos in frontier_locations {
                 self.points_sum[pos.as_index()] += mean_points;
                 self.points_count[pos.as_index()] += 1;
                 self.estimated_unexplored_points[pos.as_index()] = self
@@ -214,7 +214,7 @@ impl RelicNodeMemory {
                 self.estimated_unexplored_points[reflected.as_index()] = self
                     .points_sum[reflected.as_index()]
                     / self.points_count[reflected.as_index()] as f32;
-            });
+            }
         }
     }
 

@@ -39,13 +39,13 @@ pub fn update_memories_and_write_output_arrays(
     last_actions: &[Vec<Action>],
     params: &KnownVariableParams,
 ) {
-    memories
+    for ((mem, obs), last_actions) in memories
         .iter_mut()
         .zip_eq(observations.iter())
         .zip_eq(last_actions.iter())
-        .for_each(|((mem, obs), last_actions)| {
-            mem.update(obs, last_actions, &FIXED_PARAMS, params)
-        });
+    {
+        mem.update(obs, last_actions, &FIXED_PARAMS, params);
+    }
     write_obs_arrays(
         obs_slice.temporal_spatial_obs.view_mut(),
         obs_slice.nontemporal_spatial_obs.view_mut(),

@@ -75,14 +75,14 @@ impl FullReplay {
                 }
             });
             state.initialize_relic_nodes(spawn_schedule, self.get_map_size());
-            active_nodes.into_iter().for_each(|(pos, config)| {
+            for (pos, config) in active_nodes {
                 state.add_relic_node(
                     pos,
                     config,
                     self.get_relic_config_size(),
                     self.get_map_size(),
                 )
-            });
+            }
             state.sort();
             // In the replay file, each observed energy field is from the previous
             // step's computed energy field

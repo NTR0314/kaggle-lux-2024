@@ -248,13 +248,14 @@ fn determine_nebula_tile_vision_reduction(
             .iter()
             .map(|n| expected_vision_power_map[n.as_index()])
         {
-            nebula_tile_vision_reduction
+            for (_, mask) in nebula_tile_vision_reduction
                 .iter_unmasked_options_mut_mask()
-                .for_each(|(vision_reduction, mask)| {
-                    if *vision_reduction >= expected_vision {
-                        *mask = false
-                    }
-                });
+                .filter(|(&vision_reduction, _)| {
+                    vision_reduction >= expected_vision
+                })
+            {
+                *mask = false;
+            }
         }
     }
 

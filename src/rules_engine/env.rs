@@ -117,11 +117,9 @@ pub fn step(
         &state.units,
         state.relic_node_points_map.view(),
     );
-    state
-        .team_points
-        .iter_mut()
-        .zip_eq(points_scored)
-        .for_each(|(total, scored)| *total += scored);
+    for (total, scored) in state.team_points.iter_mut().zip_eq(points_scored) {
+        *total += scored;
+    }
     let match_winner = get_match_result(state, FIXED_PARAMS.max_steps_in_match);
     let (terminal_points_scored, normalized_terminal_points_scored) =
         match_winner
@@ -656,22 +654,23 @@ fn compute_vision_power_map(
     }) {
         for v in 0..=unit_sensor_range {
             let range = unit_sensor_range - v;
-            vision_power_map
+            for value in vision_power_map
                 .slice_mut(s![
                     team,
                     x.saturating_sub(range)..(x + range + 1).min(width),
                     y.saturating_sub(range)..(y + range + 1).min(height),
                 ])
                 .iter_mut()
-                .for_each(|value| *value += 1);
+            {
+                *value += 1;
+            }
         }
         vision_power_map[[team, x, y]] += UNIT_VISION_BONUS;
     }
     for (x, y) in nebulae.iter().map(|n| (n.x, n.y)) {
-        vision_power_map
-            .slice_mut(s![.., x, y])
-            .iter_mut()
-            .for_each(|value| *value -= nebula_tile_vision_reduction);
+        for value in vision_power_map.slice_mut(s![.., x, y]).iter_mut() {
+            *value -= nebula_tile_vision_reduction
+        }
     }
     vision_power_map
 }
@@ -2160,10 +2159,12 @@ mod tests {
                 last_points.fill(0);
                 assert_eq!(game_result.match_winner.is_some(), true);
             } else {
-                last_points
+                for (total, scored) in last_points
                     .iter_mut()
                     .zip_eq(game_result.points_scored.into_iter())
-                    .for_each(|(total, scored)| *total += scored);
+                {
+                    *total += scored;
+                }
             }
             assert_eq!(state.team_points, last_points);
             assert!(!game_over);

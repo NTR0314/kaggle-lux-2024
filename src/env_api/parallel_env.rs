@@ -78,9 +78,9 @@ impl ParallelEnv {
 
     /// Manually terminates the specified env IDs
     fn terminate_envs(&mut self, env_ids: Vec<usize>) {
-        env_ids
-            .into_iter()
-            .for_each(|env_id| self.env_data[env_id].terminate())
+        for env_id in env_ids {
+            self.env_data[env_id].terminate()
+        }
     }
 
     fn get_empty_outputs<'py>(&self, py: Python<'py>) -> PyEnvOutputs<'py> {
@@ -356,11 +356,13 @@ impl ParallelEnv {
             actions,
             &env_data.player_data.known_params,
         );
-        env_slice
+        for (slice_reward, r) in env_slice
             .reward
             .iter_mut()
             .zip_eq(reward_space.get_reward(result))
-            .for_each(|(slice_reward, r)| *slice_reward = r);
+        {
+            *slice_reward = r
+        }
         *env_slice.done = result.done;
     }
     fn write_game_stats(

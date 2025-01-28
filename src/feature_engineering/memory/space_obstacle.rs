@@ -352,33 +352,30 @@ fn update_nebula_tile_drift_speed(
         nebula_tile_drift_speed.mask.clone();
     // not_drifting_impossible => objects have definitely drifted
     if not_drifting_impossible {
-        nebula_tile_drift_speed
+        for (_, mask) in nebula_tile_drift_speed
             .iter_unmasked_options_mut_mask()
-            .for_each(|(&speed, mask)| {
-                if !should_drift(step, speed) {
-                    *mask = false;
-                }
-            })
+            .filter(|(&speed, _)| !should_drift(step, speed))
+        {
+            *mask = false;
+        }
     }
     // negative_drift_impossible => drifted positively or not moved
     if negative_drift_impossible {
-        nebula_tile_drift_speed
+        for (_, mask) in nebula_tile_drift_speed
             .iter_unmasked_options_mut_mask()
-            .for_each(|(&speed, mask)| {
-                if should_negative_drift(step, speed) {
-                    *mask = false;
-                }
-            })
+            .filter(|(&speed, _)| should_negative_drift(step, speed))
+        {
+            *mask = false;
+        }
     }
     // positive_drift_impossible => drifted negatively or not moved
     if positive_drift_impossible {
-        nebula_tile_drift_speed
+        for (_, mask) in nebula_tile_drift_speed
             .iter_unmasked_options_mut_mask()
-            .for_each(|(&speed, mask)| {
-                if should_positive_drift(step, speed) {
-                    *mask = false;
-                }
-            })
+            .filter(|(&speed, _)| should_positive_drift(step, speed))
+        {
+            *mask = false;
+        }
     }
 
     if nebula_tile_drift_speed.all_masked() {
