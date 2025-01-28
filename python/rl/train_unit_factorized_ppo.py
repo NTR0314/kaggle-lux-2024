@@ -420,7 +420,9 @@ def collect_trajectories(
         batch_done.append(last_out.done[:, None].repeat(2, axis=1))
         if step < cfg.steps_per_update:
             env.step(model_out.to_player_env_actions(last_out.action_info.unit_indices))
-            stats = env.last_out.stats or stats
+            stats = Stats.merge(
+                stats, env.last_out.stats, include_array_stats=cfg.log_histograms
+            )
 
     experience = ExperienceBatch.from_lists(
         obs=batch_obs,

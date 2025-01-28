@@ -96,6 +96,35 @@ class Stats(NamedTuple):
             assert array.dtype == np.float32
 
     @classmethod
+    def merge(
+        cls,
+        stats: Union["Stats", None],
+        other: Union["Stats", None],
+        include_array_stats: bool,
+    ) -> Union["Stats", None]:
+        if other is None:
+            return stats
+
+        if stats is None:
+            return other
+
+        assert stats.scalar_stats.keys() == other.scalar_stats.keys()
+        scalar_stats = {
+            key: (value + other.scalar_stats[key]) / 2
+            for key, value in stats.scalar_stats.items()
+        }
+        if include_array_stats:
+            assert stats.array_stats.keys() == other.array_stats.keys()
+            array_stats = {
+                key: np.concatenate([value, other.array_stats[key]], axis=0)
+                for key, value in stats.array_stats.items()
+            }
+        else:
+            array_stats = {}
+
+        return Stats(scalar_stats=scalar_stats, array_stats=array_stats)
+
+    @classmethod
     def from_raw(cls, raw: StatsArrays | None) -> Union["Stats", None]:
         if raw is None:
             return None
