@@ -1,4 +1,4 @@
-from enum import Enum
+from enum import IntEnum
 from typing import NamedTuple, Union
 
 import numpy as np
@@ -203,10 +203,23 @@ class FrameStackedObs(NamedTuple):
         )
 
 
-class Action(Enum):
+class Action(IntEnum):
     NO_OP = 0
     UP = 1
     RIGHT = 2
     DOWN = 3
     LEFT = 4
     SAP = 5
+
+    def as_move_delta(self) -> tuple[int, int]:
+        match self:
+            case Action.UP:
+                return 0, -1
+            case Action.RIGHT:
+                return 1, 0
+            case Action.DOWN:
+                return 0, 1
+            case Action.LEFT:
+                return -1, 0
+            case action:
+                raise ValueError(f"as_move_delta not implemented for {action}")
