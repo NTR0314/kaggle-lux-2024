@@ -274,6 +274,8 @@ def main() -> None:
     lr_scheduler = build_lr_scheduler(cfg, optimizer)
     train_state = TrainState(
         model=model,
+        # TODO: Use last_best_model
+        last_best_model=model,
         teacher_model=None,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
@@ -480,9 +482,15 @@ def update_model(
             batch_stats = update_model_on_batch(
                 train_state=train_state,
                 experience=experience.index(minibatch_slice).to_device(cfg.device),
-                unit_advantages=unit_advantages[minibatch_slice].to(cfg.device),
-                unit_returns=unit_returns[minibatch_slice].to(cfg.device),
-                agent_returns=agent_returns[minibatch_slice].to(cfg.device),
+                unit_advantages=unit_advantages[minibatch_slice].to(
+                    cfg.device, non_blocking=True
+                ),
+                unit_returns=unit_returns[minibatch_slice].to(
+                    cfg.device, non_blocking=True
+                ),
+                agent_returns=agent_returns[minibatch_slice].to(
+                    cfg.device, non_blocking=True
+                ),
                 cfg=cfg,
             )
             for k, v in batch_stats.items():
