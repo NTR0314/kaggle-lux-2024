@@ -4,17 +4,16 @@ import datetime
 import itertools
 import logging
 import math
-import threading
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
 from pathlib import Path
-from queue import SimpleQueue
 from typing import Annotated, Final
 
 import numpy as np
 import numpy.typing as npt
 import torch
+import torch.multiprocessing as mp
 import wandb
 import yaml
 from pydantic import (
@@ -28,7 +27,11 @@ from pydantic import (
 )
 from rux_ai_s3.lowlevel import RewardSpace, assert_release_build
 from rux_ai_s3.models.actor_critic import ActorCritic, ActorCriticOut
-from rux_ai_s3.models.build import ActorCriticConfig, build_actor_critic
+from rux_ai_s3.models.build import (
+    ActorCriticConfigT,
+    ActorCriticConfigWrapper,
+    build_actor_critic,
+)
 from rux_ai_s3.models.types import TorchActionInfo, TorchObs
 from rux_ai_s3.models.utils import remove_compile_prefix
 from rux_ai_s3.parallel_env import EnvConfig, ParallelEnv
@@ -62,6 +65,7 @@ from rux_ai_s3.types import Stats
 from rux_ai_s3.utils import load_from_yaml
 from torch import optim
 from torch.amp import GradScaler  # type: ignore[attr-defined]
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.optim.lr_scheduler import LambdaLR
 
 TrainStateT = TrainState[ActorCritic]
@@ -233,7 +237,7 @@ class PPOConfig(TrainConfig):
 
     # Config objects
     env_config: EnvConfig
-    rl_model_config: ActorCriticConfig
+    rl_model_config: ActorCriticConfigT
 
     # Miscellaneous config
     device: torch.device
@@ -307,7 +311,7 @@ class PPOConfig(TrainConfig):
 
         return (i for i in range(1, self.max_updates + 1))
 
-    def load_teacher_config(self) -> tuple[Path, ActorCriticConfig] | None:
+    def load_teacher_config(self) -> tuple[Path, ActorCriticConfigT] | None:
         if self.teacher_path is None:
             return None
 
@@ -315,15 +319,72 @@ class PPOConfig(TrainConfig):
         with open(teacher_config_path) as f:
             data = yaml.safe_load(f)
 
-        return self.teacher_path, ActorCriticConfig(**data["rl_model_config"])
+        parsed_config = ActorCriticConfigWrapper(config=data["rl_model_config"])
+        return self.teacher_path, parsed_config.config
 
 
-@dataclass
-class EvalState:
-    env: ParallelEnv
-    results: SimpleQueue[tuple[float, int]]
-    model: ActorCritic
-    thread: threading.Thread | None = None
+class EvalProcess:
+    def __init__(
+        self,
+        current_model: ActorCritic,
+        last_best_model: ActorCritic,
+        cfg: PPOConfig,
+    ) -> None:
+        self.current_model = current_model
+        self.start: mp.Queue[int] = mp.Queue(maxsize=1)
+        self.results: mp.Queue[tuple[float | None, int]] = mp.Queue(maxsize=1)
+        self.in_progress: list[int] = []
+        self.process = mp.Process(
+            target=model_evaluation_process,
+            args=(
+                cfg.model_dump_json(),
+                self.current_model,
+                last_best_model,
+                self.start,
+                self.results,
+            ),
+            daemon=True,
+        )
+        self.process.start()
+
+    def get_result_if_available(self) -> tuple[float, int] | None:
+        if self.results.empty():
+            return None
+
+        win_rate, step = self.results.get_nowait()
+        self.in_progress.remove(step)
+        if win_rate is None:
+            return None
+
+        return win_rate, step
+
+    def start_evaluation(self, step: int, model: ActorCritic) -> None:
+        if self.in_progress:
+            logger.warning("Interrupting training to wait on evaluation thread")
+            wait_time = self._wait_for_result()
+            logger.warning(
+                "Waited %d seconds for evaluation to complete",
+                round(wait_time.total_seconds()),
+            )
+
+        self.current_model.load_state_dict(
+            {
+                remove_compile_prefix(key): value
+                for key, value in model.state_dict().items()
+            }
+        )
+        self.in_progress.append(step)
+        self.start.put_nowait(step)
+
+    def _wait_for_result(self) -> datetime.timedelta:
+        wait_start = datetime.datetime.now()
+        while self.results.empty():
+            if not self.process.is_alive():
+                raise RuntimeError("Evaluation process failed")
+
+            time.sleep(1.0)
+
+        return datetime.datetime.now() - wait_start
 
 
 @dataclass(frozen=True)
@@ -416,8 +477,12 @@ def main() -> None:  # noqa: C901
     logger.info("Loaded config from %s", args.config_file)
     env = ParallelEnv.from_config(cfg.env_config)
     model = build_model(env, cfg.rl_model_config).to(cfg.device).train()
-    last_best_model = build_model(env, cfg.rl_model_config).to(cfg.eval_device).eval()
-    eval_model = build_model(env, cfg.rl_model_config).to(cfg.eval_device).eval()
+    last_best_model = (
+        build_model(env, cfg.rl_model_config).to(cfg.eval_device).eval().share_memory()
+    )
+    eval_model = (
+        build_model(env, cfg.rl_model_config).to(cfg.eval_device).eval().share_memory()
+    )
     if args.model_weights:
         load_model_weights(
             model,
@@ -431,6 +496,7 @@ def main() -> None:  # noqa: C901
     logger.info(
         "Training model with %s parameters", f"{count_trainable_params(model):,d}"
     )
+    # TODO: Use last_best as teacher model
     teacher_model = load_teacher_model(env, cfg)
     if args.release:
         model = torch.compile(model)  # type: ignore[assignment]
@@ -447,10 +513,10 @@ def main() -> None:  # noqa: C901
         lr_scheduler=lr_scheduler,
         scaler=GradScaler("cuda"),
     )
-    eval_state = EvalState(
-        env=ParallelEnv.from_config(cfg.eval_env_config),
-        results=SimpleQueue(),
-        model=eval_model,
+    eval_process = EvalProcess(
+        current_model=eval_model,
+        last_best_model=last_best_model,
+        cfg=cfg,
     )
     if args.checkpoint:
         wandb_init_config = (
@@ -479,16 +545,20 @@ def main() -> None:  # noqa: C901
     last_checkpoint = datetime.datetime.now()
     try:
         for _ in cfg.iter_updates():
-            if eval_state.results.empty():
+            eval_result = eval_process.get_result_if_available()
+            if eval_result is None:
                 extra_log_info = {}
             else:
-                (win_rate, eval_step) = eval_state.results.get()
+                (win_rate, eval_step) = eval_result
                 extra_log_info = {"win_rate_vs_last_best": win_rate}
                 logger.info(
                     "Win rate vs last best on step %d: %.4f", eval_step, win_rate
                 )
                 if win_rate > WIN_RATE_THRESHOLD:
                     logger.info("Updated last best on step %d", eval_step)
+                    train_state.last_best_model.load_state_dict(
+                        eval_process.current_model.state_dict()
+                    )
 
             train_step(
                 env=env,
@@ -505,14 +575,14 @@ def main() -> None:  # noqa: C901
                 train_state,
                 logger,
             )
-            start_model_evaluation(eval_state, train_state, cfg)
+            eval_process.start_evaluation(train_state.step, train_state.model)
     finally:
         save_checkpoint(train_state, logger)
 
 
 def build_model(
     env: ParallelEnv,
-    config: ActorCriticConfig,
+    config: ActorCriticConfigT,
 ) -> ActorCritic:
     example_obs = env.get_frame_stacked_obs()
     spatial_in_channels = example_obs.spatial_obs.shape[2]
@@ -577,19 +647,8 @@ def train_step(
         scalar_stats.update(stats.scalar_stats)
         array_stats.update(stats.array_stats)
 
-    total_time = time.perf_counter() - step_start_time
-    batches_per_epoch = math.ceil(cfg.full_batch_size / cfg.train_batch_size)
     (scalar_stats["lr"],) = train_state.lr_scheduler.get_last_lr()
     scalar_stats["game_steps"] = train_state.step * cfg.game_steps_per_update
-    scalar_stats["updates_per_second"] = (
-        batches_per_epoch * cfg.epochs_per_update / total_time
-    )
-    scalar_stats["env_steps_per_second"] = (
-        cfg.env_config.n_envs * cfg.steps_per_update / total_time
-    )
-    scalar_stats["update_data_collection_time"] = data_collection_time
-    scalar_stats["update_train_time"] = train_time
-    scalar_stats["update_total_time"] = total_time
     assert experience.reward.shape[-1] == 2
     nonzero_reward = experience.reward[experience.reward != 0.0]
     if len(nonzero_reward) > 0:
@@ -597,6 +656,19 @@ def train_step(
         scalar_stats["mean_nonzero_reward"] = nonzero_reward.mean().item()
         scalar_stats["p1_mean_nonzero_reward"] = nonzero_reward[..., 0].mean().item()
         scalar_stats["p2_mean_nonzero_reward"] = nonzero_reward[..., 1].mean().item()
+
+    if train_state.finished_warmup:
+        total_time = time.perf_counter() - step_start_time
+        batches_per_epoch = math.ceil(cfg.full_batch_size / cfg.train_batch_size)
+        scalar_stats["updates_per_second"] = (
+            batches_per_epoch * cfg.epochs_per_update / total_time
+        )
+        scalar_stats["env_steps_per_second"] = (
+            cfg.env_config.n_envs * cfg.steps_per_update / total_time
+        )
+        scalar_stats["update_data_collection_time"] = data_collection_time
+        scalar_stats["update_train_time"] = train_time
+        scalar_stats["update_total_time"] = total_time
 
     log_results(
         train_state.step,
@@ -609,60 +681,44 @@ def train_step(
         logger=logger,
     )
     train_state.lr_scheduler.step()
-    train_state.step += 1
+    train_state.increment_step()
 
 
-def start_model_evaluation(
-    eval_state: EvalState,
-    train_state: TrainStateT,
-    cfg: PPOConfig,
+def model_evaluation_process(
+    cfg_json: str,
+    current_model: ActorCritic,
+    last_best_model: ActorCritic,
+    start: "mp.Queue[int]",
+    results: "mp.Queue[tuple[float | None, int]]",
 ) -> None:
-    if cfg.eval_games <= 0:
-        return
+    cfg = PPOConfig.model_validate_json(cfg_json)
+    env = ParallelEnv.from_config(cfg.eval_env_config)
+    while True:
+        step = start.get()
+        if cfg.eval_games <= 0:
+            results.put((None, step))
+            continue
 
-    if eval_state.thread is not None and eval_state.thread.is_alive():
-        logger.warning("Interrupting training to wait on evaluation thread")
-        wait_start = datetime.datetime.now()
-        eval_state.thread.join()
-        wait_time = datetime.datetime.now() - wait_start
-        logger.warning(
-            "Waited %s seconds for evaluation to complete",
-            wait_time.total_seconds(),
+        win_rate = evaluate_model(
+            env,
+            model=current_model,
+            last_best=last_best_model,
+            cfg=cfg,
         )
-
-    eval_state.model.load_state_dict(
-        {
-            remove_compile_prefix(key): value
-            for key, value in train_state.model.state_dict().items()
-        }
-    )
-    eval_state.thread = threading.Thread(
-        target=evaluate_model,
-        args=(
-            eval_state.env,
-            eval_state.results,
-            eval_state.model,
-            train_state.last_best_model,
-            cfg,
-            train_state.step,
-        ),
-        daemon=True,
-    )
-    eval_state.thread.start()
+        results.put((win_rate, step))
 
 
 @torch.no_grad()
 def evaluate_model(
     eval_env: ParallelEnv,
-    queue: SimpleQueue[tuple[float, int]],
     model: ActorCritic,
     last_best: ActorCritic,
     cfg: PPOConfig,
-    step: int,
-) -> None:
+) -> float:
+    # Could use different spda kernel if eval GPU supports flash attention
     with torch.autocast(
         device_type="cuda", dtype=torch.float16, enabled=cfg.use_mixed_precision
-    ):
+    ), sdpa_kernel(SDPBackend.MATH):
         w1, l1 = run_match(
             eval_env,
             (model, last_best),
@@ -676,11 +732,7 @@ def evaluate_model(
             cfg.eval_device,
         )
 
-    win_rate = (w1 + w2) / (w1 + w2 + l1 + l2)
-    if win_rate >= WIN_RATE_THRESHOLD:
-        last_best.load_state_dict(model.state_dict())
-
-    queue.put((win_rate, step))
+    return (w1 + w2) / (w1 + w2 + l1 + l2)
 
 
 @torch.no_grad()
@@ -902,4 +954,5 @@ def step_optimizer(
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn")
     main()

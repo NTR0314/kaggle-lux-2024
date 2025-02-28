@@ -93,6 +93,9 @@ class Agent:
     def get_empty_actions(self) -> ActionArray:
         return np.zeros((self.max_units, 3), dtype=np.int64)
 
+    def low_on_time(self, remaining_overage_time: float) -> bool:
+        return remaining_overage_time <= 1.0 + 3.0 * len(self.data_augmenters)
+
     def build_model(self) -> ModelTypes:
         example_obs = self.fe_env.get_frame_stacked_obs()
         spatial_in_channels = example_obs.spatial_obs.shape[1]
@@ -118,12 +121,18 @@ class Agent:
         return model.to(self.device).eval()
 
     def act(
-        self, _step: int, obs: dict[str, Any], _remaining_overage_time: int
+        self, _step: int, obs: dict[str, Any], remaining_overage_time: float
     ) -> ActionArray:
+        while self.data_augmenters and self.low_on_time(remaining_overage_time):
+            self.data_augmenters.pop()
+
         raw_obs = json.dumps(to_json(obs))
         is_new_match = obs["match_steps"] == 0
         self.fe_env.step(raw_obs, self.last_actions, is_new_match=is_new_match)
-        if is_new_match:
+        stop_playing = self.low_on_time(remaining_overage_time) and self.game_over(
+            obs["team_wins"]
+        )
+        if is_new_match or stop_playing:
             self.last_actions = self.get_empty_actions()
         else:
             self.last_actions = self.get_new_actions()
@@ -258,6 +267,11 @@ class Agent:
             raise NotImplementedError
 
         assert_never(model_out)
+
+    @staticmethod
+    def game_over(team_wins: list[int]) -> bool:
+        w1, w2 = team_wins
+        return w1 >= 3 or w2 >= 3
 
     @staticmethod
     def build_data_augmenters(

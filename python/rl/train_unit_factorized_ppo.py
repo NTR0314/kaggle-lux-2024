@@ -21,7 +21,7 @@ from rux_ai_s3.models.actor_critic import (
     FactorizedActorCritic,
     FactorizedActorCriticOut,
 )
-from rux_ai_s3.models.build import ActorCriticConfig, build_actor_critic
+from rux_ai_s3.models.build import ActorCriticConfigT, build_actor_critic
 from rux_ai_s3.models.types import TorchActionInfo, TorchObs
 from rux_ai_s3.parallel_env import EnvConfig, ParallelEnv
 from rux_ai_s3.rl_training.constants import PROJECT_NAME
@@ -135,7 +135,7 @@ class UnitFactorizedPPOConfig(TrainConfig):
 
     # Config objects
     env_config: EnvConfig
-    rl_model_config: ActorCriticConfig
+    rl_model_config: ActorCriticConfigT
 
     # Miscellaneous config
     device: torch.device
@@ -274,12 +274,14 @@ def main() -> None:
     lr_scheduler = build_lr_scheduler(cfg, optimizer)
     train_state = TrainState(
         model=model,
-        # TODO: Use last_best_model
         last_best_model=model,
         teacher_model=None,
         optimizer=optimizer,
         lr_scheduler=lr_scheduler,
         scaler=GradScaler("cuda"),
+    )
+    raise NotImplementedError(
+        "Use last_best_model to measure performance as in train_ppo.py"
     )
     if args.checkpoint:
         wandb_init_config = (
@@ -317,7 +319,7 @@ def main() -> None:
                 last_checkpoint = now
                 save_checkpoint(train_state, logger)
     finally:
-        train_state.step += 1
+        train_state.increment_step()
         save_checkpoint(train_state, logger)
 
 
@@ -392,7 +394,7 @@ def train_step(
         logger=logger,
     )
     train_state.lr_scheduler.step()
-    train_state.step += 1
+    train_state.increment_step()
 
 
 @torch.no_grad()
