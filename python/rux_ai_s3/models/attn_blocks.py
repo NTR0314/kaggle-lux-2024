@@ -53,7 +53,8 @@ class AttnBlock(nn.Module):
         self.mha = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
-            dropout=dropout or 0.0,
+            # Notably exclude dropout from MHA layer itself
+            dropout=0.0,
             batch_first=True,
         )
         self.dropout = nn.Dropout(dropout or 0.0)
@@ -107,7 +108,6 @@ class SpatialAttnIn(nn.Module):
         assert self.d_head % 2 == 0
         assert self.d_head / 2 >= 8
         self.num_heads = num_heads
-        self.dropout_p = dropout or 0.0
         self.rotary_emb = RotaryEmbedding(
             dim=self.d_head // 2,
             freqs_for="pixel",
@@ -154,7 +154,11 @@ class SpatialAttnIn(nn.Module):
             == (batch_size, self.num_heads, seq_len, self.d_head)
         )
         x = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.dropout_p if self.training else 0.0
+            q,
+            k,
+            v,
+            # Notably exclude dropout from attention layer itself
+            dropout_p=0.0,
         )
         # x shape is now (batch_size, num_heads, seq_len, d_head)
         x = x.permute(0, 2, 1, 3).flatten(2, 3)
