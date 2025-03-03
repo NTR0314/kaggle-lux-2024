@@ -137,7 +137,7 @@ class Agent:
         else:
             self.last_actions = self.get_new_actions()
 
-        # TODO: Log memory statuses and estimated value
+        # TODO: Log memory statuses
         return self.last_actions
 
     def get_new_actions(self) -> ActionArray:

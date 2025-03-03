@@ -5,6 +5,7 @@ optimizer_kwargs:
 lr_schedule:
   steps: 150_000
   min_factor: 0.25
+clip_gradients: 10.0
 steps_per_update: 32
 epochs_per_update: 1
 train_batch_size: 128

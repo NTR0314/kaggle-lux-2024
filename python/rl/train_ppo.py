@@ -66,6 +66,7 @@ from rux_ai_s3.utils import load_from_yaml
 from torch import optim
 from torch.amp import GradScaler  # type: ignore[attr-defined]
 from torch.nn.attention import SDPBackend, sdpa_kernel
+from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import LambdaLR
 
 TrainStateT = TrainState[ActorCritic]
@@ -224,6 +225,7 @@ class PPOConfig(TrainConfig):
     max_updates: int | None
     optimizer_kwargs: dict[str, float]
     lr_schedule: LRScheduleConfig
+    clip_gradients: float | None
     steps_per_update: int
     epochs_per_update: int
     train_batch_size: int
@@ -295,6 +297,10 @@ class PPOConfig(TrainConfig):
     @property
     def game_steps_per_update(self) -> int:
         return self.env_config.n_envs * self.steps_per_update
+
+    @property
+    def batches_per_epoch(self) -> int:
+        return math.ceil(self.full_batch_size / self.train_batch_size)
 
     @property
     def eval_env_config(self) -> EnvConfig:
@@ -542,6 +548,13 @@ def main() -> None:  # noqa: C901
             config=cfg.model_dump(),
         )
 
+    if wandb.run:
+        wandb.watch(
+            train_state.model,
+            log="all",
+            log_freq=200 * cfg.batches_per_epoch,
+        )
+
     last_checkpoint = datetime.datetime.now()
     try:
         for _ in cfg.iter_updates():
@@ -659,9 +672,8 @@ def train_step(
 
     if train_state.finished_warmup:
         total_time = time.perf_counter() - step_start_time
-        batches_per_epoch = math.ceil(cfg.full_batch_size / cfg.train_batch_size)
         scalar_stats["updates_per_second"] = (
-            batches_per_epoch * cfg.epochs_per_update / total_time
+            cfg.batches_per_epoch * cfg.epochs_per_update / total_time
         )
         scalar_stats["env_steps_per_second"] = (
             cfg.env_config.n_envs * cfg.steps_per_update / total_time
@@ -945,10 +957,17 @@ def step_optimizer(
     train_state.optimizer.zero_grad()
     if not cfg.use_mixed_precision:
         total_loss.backward()
+        if cfg.clip_gradients:
+            clip_grad_norm_(train_state.model.parameters(), cfg.clip_gradients)
+
         train_state.optimizer.step()
         return
 
     train_state.scaler.scale(total_loss).backward()
+    if cfg.clip_gradients:
+        train_state.scaler.unscale_(train_state.optimizer)
+        clip_grad_norm_(train_state.model.parameters(), cfg.clip_gradients)
+
     train_state.scaler.step(train_state.optimizer)
     train_state.scaler.update()
 
