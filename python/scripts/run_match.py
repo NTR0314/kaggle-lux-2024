@@ -53,11 +53,11 @@ def main() -> None:
     p1_config = args.get_p1_config()
     p2_config = args.get_p2_config()
     assert p1_config.frame_stack_len == p2_config.frame_stack_len
-    assert p1_config.use_sap_masking == p2_config.use_sap_masking
+    assert p1_config.sap_masking == p2_config.sap_masking
     env = ParallelEnv(
         n_envs=args.get_batch_size(),
         frame_stack_len=p1_config.env_config.frame_stack_len,
-        use_sap_masking=p1_config.use_sap_masking,
+        sap_masking=p1_config.sap_masking,
         reward_space=RewardSpace.FINAL_WINNER,
         jax_device=jax.devices("cpu")[0],
     )

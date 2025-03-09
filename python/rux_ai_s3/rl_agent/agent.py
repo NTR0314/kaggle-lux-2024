@@ -67,7 +67,7 @@ class Agent:
         self.fe_env = FeatureEngineeringEnv(
             frame_stack_len=self.train_config.frame_stack_len,
             team_id=self.team_id,
-            use_sap_masking=self.train_config.use_sap_masking,
+            sap_masking=self.train_config.sap_masking,
             env_params=env_cfg,
         )
         self.last_actions = self.get_empty_actions()

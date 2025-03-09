@@ -4,7 +4,7 @@ use crate::env_api::env_data::{
 use crate::env_api::utils::{
     action_array_to_vec, update_memories_and_write_output_arrays,
 };
-use crate::env_config::RewardSpace;
+use crate::env_config::{RewardSpace, SapMasking};
 use crate::feature_engineering::action_space::get_main_action_count;
 use crate::feature_engineering::obs_space::basic_obs_space::{
     get_nontemporal_global_feature_count,
@@ -60,7 +60,7 @@ type PyEnvOutputs<'py> = (
 #[pyclass]
 pub struct ParallelEnv {
     n_envs: usize,
-    use_sap_masking: bool,
+    sap_masking: SapMasking,
     reward_space: RewardSpace,
     env_data: Vec<EnvData>,
 }
@@ -70,14 +70,14 @@ impl ParallelEnv {
     #[new]
     fn new(
         n_envs: usize,
-        use_sap_masking: bool,
+        sap_masking: SapMasking,
         reward_space: RewardSpace,
     ) -> Self {
         let env_data = (0..n_envs).map(|_| EnvData::new()).collect();
         Self {
             n_envs,
             reward_space,
-            use_sap_masking,
+            sap_masking,
             env_data,
         }
     }
@@ -351,7 +351,7 @@ impl ParallelEnv {
                         &mut env_data.player_data.memories,
                         &obs,
                         &[Vec::new(), Vec::new()],
-                        self.use_sap_masking,
+                        self.sap_masking,
                         &env_data.player_data.known_params,
                     );
                 },
@@ -382,7 +382,7 @@ impl ParallelEnv {
                 &mut rng,
                 slice,
                 &actions,
-                self.use_sap_masking,
+                self.sap_masking,
                 self.reward_space,
             );
         }
@@ -417,7 +417,7 @@ impl ParallelEnv {
                             rng,
                             slice,
                             &actions,
-                            self.use_sap_masking,
+                            self.sap_masking,
                             self.reward_space,
                         );
                     },
@@ -436,7 +436,7 @@ impl ParallelEnv {
         rng: &mut ThreadRng,
         mut env_slice: SingleEnvView,
         actions: &[Vec<Action>; P],
-        use_sap_masking: bool,
+        sap_masking: SapMasking,
         reward_space: RewardSpace,
     ) {
         let (obs, result, stats) = step(
@@ -454,7 +454,7 @@ impl ParallelEnv {
             &mut env_data.player_data.memories,
             &obs,
             actions,
-            use_sap_masking,
+            sap_masking,
             &env_data.player_data.known_params,
         );
         for (slice_reward, r) in env_slice

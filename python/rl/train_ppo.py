@@ -307,7 +307,7 @@ class PPOConfig(TrainConfig):
         return EnvConfig(
             n_envs=min(self.eval_games // 2, self.env_config.n_envs),
             frame_stack_len=self.env_config.frame_stack_len,
-            use_sap_masking=self.env_config.use_sap_masking,
+            sap_masking=self.env_config.sap_masking,
             reward_space=RewardSpace.FINAL_WINNER,
             jax_device=self.env_config.jax_device,
         )

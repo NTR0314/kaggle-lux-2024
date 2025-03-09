@@ -1,7 +1,9 @@
+use crate::env_config::SapMasking;
 use crate::feature_engineering::utils::one_hot_bool_encode_param_range;
 use crate::izip_eq;
 use crate::rules_engine::action::Action;
 use crate::rules_engine::action::Action::{Down, Left, NoOp, Right, Sap, Up};
+use crate::rules_engine::env::get_spawn_position;
 use crate::rules_engine::param_ranges::ParamRanges;
 use crate::rules_engine::params::KnownVariableParams;
 use crate::rules_engine::state::{Observation, Pos, Unit};
@@ -24,7 +26,7 @@ pub fn write_basic_action_space(
     mut sap_mask: ArrayViewMut4<bool>,
     observations: &[Observation],
     known_valuable_points_map: &[ArrayView2<bool>],
-    use_sap_masking: bool,
+    sap_masking: SapMasking,
     params: &KnownVariableParams,
     param_ranges: &ParamRanges,
 ) {
@@ -39,7 +41,7 @@ pub fn write_basic_action_space(
             team_sap_mask,
             obs,
             known_valuable_points_map.view(),
-            use_sap_masking,
+            sap_masking,
             params,
             param_ranges,
         );
@@ -51,7 +53,7 @@ fn write_team_actions(
     mut sap_mask: ArrayViewMut3<bool>,
     obs: &Observation,
     known_valuable_points_map: ArrayView2<bool>,
-    use_sap_masking: bool,
+    sap_masking: SapMasking,
     params: &KnownVariableParams,
     param_ranges: &ParamRanges,
 ) {
@@ -61,23 +63,23 @@ fn write_team_actions(
 
     let (_, width, height) = sap_mask.dim();
     let map_size = [width, height];
-    let sap_targets_map =
-        get_sap_targets_map(obs, known_valuable_points_map, map_size);
+    let sap_targets_map = match sap_masking {
+        SapMasking::PointTiles => get_point_tile_sap_targets_map(
+            obs,
+            known_valuable_points_map,
+            map_size,
+        ),
+        SapMasking::OppUnitFrontier => {
+            get_unit_frontier_sap_targets_map(obs, map_size)
+        },
+    };
     for unit in obs.get_my_units().iter().filter(|u| u.alive()) {
-        let can_sap = if use_sap_masking {
-            write_sap_mask(
-                sap_mask.index_axis_mut(Axis(0), unit.id),
-                &sap_targets_map,
-                *unit,
-                params,
-            )
-        } else {
-            write_sap_mask_no_masking(
-                sap_mask.index_axis_mut(Axis(0), unit.id),
-                *unit,
-                params,
-            )
-        };
+        let can_sap = write_sap_mask(
+            sap_mask.index_axis_mut(Axis(0), unit.id),
+            &sap_targets_map,
+            *unit,
+            params,
+        );
         let mut unit_action_mask =
             vec![false; get_main_action_count(param_ranges)];
         for (idx, action) in Action::iter().enumerate() {
@@ -130,14 +132,15 @@ fn write_sap_mask(
     if unit.energy < params.unit_sap_cost {
         return false;
     }
+
     let (width, height) = sap_mask.dim();
-    let mut unit_can_sap = false;
     let [x, y]: [usize; 2] = unit.pos.into();
     let range = params.unit_sap_range as usize;
     let slice = s![
         x.saturating_sub(range)..=(x + range).min(width - 1),
         y.saturating_sub(range)..=(y + range).min(height - 1),
     ];
+    let mut unit_can_sap = false;
     Zip::from(sap_mask.slice_mut(slice))
         .and(sap_targets_map.slice(slice))
         .for_each(|sap_mask, &legal_sap| {
@@ -147,35 +150,17 @@ fn write_sap_mask(
     unit_can_sap
 }
 
-fn write_sap_mask_no_masking(
-    mut sap_mask: ArrayViewMut2<bool>,
-    unit: Unit,
-    params: &KnownVariableParams,
-) -> bool {
-    let (width, height) = sap_mask.dim();
-    let [x, y]: [usize; 2] = unit.pos.into();
-    let range = params.unit_sap_range as usize;
-    let slice = s![
-        x.saturating_sub(range)..=(x + range).min(width - 1),
-        y.saturating_sub(range)..=(y + range).min(height - 1),
-    ];
-    sap_mask.slice_mut(slice).fill(true);
-    unit.energy >= params.unit_sap_cost
-}
-
-fn get_sap_targets_map(
+fn get_point_tile_sap_targets_map(
     obs: &Observation,
     known_valuable_points_map: ArrayView2<bool>,
     map_size: [usize; 2],
 ) -> Array2<bool> {
     let mut sap_targets = Array2::default(map_size);
     let [width, height] = map_size;
-    let mut enemy_unit_locations = BTreeSet::new();
-
+    let enemy_unit_locations = get_alive_enemy_unit_locations(obs);
     // All locations adjacent to enemy units are valid sap targets
-    for unit in obs.get_opp_units().iter().filter(|u| u.alive()) {
-        enemy_unit_locations.insert(unit.pos);
-        let [x, y]: [usize; 2] = unit.pos.into();
+    for &pos in &enemy_unit_locations {
+        let [x, y]: [usize; 2] = pos.into();
         let slice = s![
             x.saturating_sub(1)..=(x + 1).min(width - 1),
             y.saturating_sub(1)..=(y + 1).min(height - 1),
@@ -216,6 +201,47 @@ fn get_sap_targets_map(
         {
             *can_sap = true;
         }
+    }
+    sap_targets
+}
+
+fn get_alive_enemy_unit_locations(obs: &Observation) -> BTreeSet<Pos> {
+    obs.get_opp_units()
+        .iter()
+        .filter_map(|u| u.alive().then_some(u.pos))
+        .collect()
+}
+
+fn get_unit_frontier_sap_targets_map(
+    obs: &Observation,
+    map_size: [usize; 2],
+) -> Array2<bool> {
+    let mut sap_targets = Array2::default(map_size);
+    let [width, height] = map_size;
+    let opp_spawn = get_spawn_position(obs.opp_team_id(), map_size);
+    let enemy_unit_locations = get_alive_enemy_unit_locations(obs);
+    for (_, can_sap) in sap_targets
+        .indexed_iter_mut()
+        .filter(|(xy, _)| {
+            opp_spawn.manhattan_distance(Pos::from(*xy))
+                <= obs.match_steps as usize + 1
+        })
+        .filter(|((x, y), _)| {
+            // Don't sap known empty space
+            (x.saturating_sub(1)..=(x + 1).min(width - 1))
+                .cartesian_product(
+                    y.saturating_sub(1)..=(y + 1).min(height - 1),
+                )
+                .any(|(adj_x, adj_y)| {
+                    might_have_sap_target(
+                        [adj_x, adj_y],
+                        &obs.sensor_mask,
+                        &enemy_unit_locations,
+                    )
+                })
+        })
+    {
+        *can_sap = true;
     }
     sap_targets
 }
@@ -301,7 +327,7 @@ mod tests {
             sap_mask.view_mut(),
             &obs,
             known_valuable_points_map.view(),
-            true,
+            SapMasking::PointTiles,
             &variable_params,
             &param_ranges,
         );
@@ -348,7 +374,7 @@ mod tests {
     }
 
     #[test]
-    fn test_get_sap_targets_map() {
+    fn test_get_point_tile_sap_targets_map() {
         let map_size = [5, 5];
         let obs = Observation {
             units: [
@@ -363,7 +389,7 @@ mod tests {
             ..Default::default()
         };
         let known_valuable_points_map = Array2::default(map_size);
-        let sap_targets_mask = get_sap_targets_map(
+        let sap_targets_mask = get_point_tile_sap_targets_map(
             &obs,
             known_valuable_points_map.view(),
             map_size,
@@ -384,7 +410,7 @@ mod tests {
             [false, false, true, false, false],
             [true, false, false, false, false],
         ]);
-        let sap_targets_mask = get_sap_targets_map(
+        let sap_targets_mask = get_point_tile_sap_targets_map(
             &obs,
             known_valuable_points_map.view(),
             map_size,
@@ -397,5 +423,10 @@ mod tests {
             [true, true, false, false, false],
         ]);
         assert_eq!(sap_targets_mask, expected_sap_targets_mask);
+    }
+
+    #[test]
+    fn test_get_unit_frontier_sap_targets_map() {
+        todo!()
     }
 }

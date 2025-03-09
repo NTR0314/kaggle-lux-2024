@@ -35,7 +35,7 @@ class SapMasking(Enum):
 
 class ParallelEnv:
     def __init__(
-        self, n_envs: int, use_sap_masking: bool, reward_space: RewardSpace
+        self, n_envs: int, sap_masking: SapMasking, reward_space: RewardSpace
     ) -> None: ...
     def terminate_envs(self, env_ids: list[int]) -> None: ...
     def get_new_match_envs(self) -> list[int]: ...
@@ -60,7 +60,7 @@ class FeatureEngineeringEnv:
     def __init__(
         self,
         team_id: int,
-        use_sap_masking: bool,
+        sap_masking: SapMasking,
         env_params: dict[str, Any],
     ) -> None: ...
     def get_empty_outputs(self) -> FeatureEngineeringFullOut: ...
