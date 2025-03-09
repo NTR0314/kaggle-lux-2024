@@ -458,14 +458,34 @@ mod tests {
             ..Default::default()
         },
         arr2(&[
+            [true, true, true, false, false],
+            [true, true, false, false, false],
+            [true, false, false, false, false],
             [false; 5],
             [false; 5],
-            [false, false, false, false, true],
-            [false, false, false, true, true],
-            [false, false, true, true, true],
         ]),
     )]
-    // TODO: More test cases
+    #[case(
+        Observation {
+            sensor_mask: arr2(&[
+                [true; 5],
+                [true; 5],
+                [true; 5],
+                [false; 5],
+                [false; 5],
+            ]),
+            team_id: 1,
+            match_steps: 7,
+            ..Default::default()
+            },
+        arr2(&[
+            [false; 5],
+            [false; 5],
+            [true; 5],
+            [true, true, true, true, false],
+            [true, true, true, false, false],
+        ]),
+    )]
     fn test_get_unit_frontier_sap_targets_map(
         #[case] obs: Observation,
         #[case] expected_sap_targets_mask: Array2<bool>,
