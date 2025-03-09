@@ -121,7 +121,6 @@ fn write_team_actions(
     }
 }
 
-#[allow(dead_code)]
 fn write_sap_mask(
     mut sap_mask: ArrayViewMut2<bool>,
     sap_targets_map: &Array2<bool>,
