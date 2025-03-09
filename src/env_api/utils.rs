@@ -37,6 +37,7 @@ pub fn update_memories_and_write_output_arrays(
     memories: &mut [Memory],
     observations: &[Observation],
     last_actions: &[Vec<Action>],
+    use_sap_masking: bool,
     params: &KnownVariableParams,
 ) {
     for ((mem, obs), last_actions) in memories
@@ -64,6 +65,7 @@ pub fn update_memories_and_write_output_arrays(
         action_info_slice.sap_mask.view_mut(),
         observations,
         &known_valuable_points_maps,
+        use_sap_masking,
         params,
         &PARAM_RANGES,
     );

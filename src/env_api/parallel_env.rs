@@ -60,6 +60,7 @@ type PyEnvOutputs<'py> = (
 #[pyclass]
 pub struct ParallelEnv {
     n_envs: usize,
+    use_sap_masking: bool,
     reward_space: RewardSpace,
     env_data: Vec<EnvData>,
 }
@@ -67,11 +68,16 @@ pub struct ParallelEnv {
 #[pymethods]
 impl ParallelEnv {
     #[new]
-    fn new(n_envs: usize, reward_space: RewardSpace) -> Self {
+    fn new(
+        n_envs: usize,
+        use_sap_masking: bool,
+        reward_space: RewardSpace,
+    ) -> Self {
         let env_data = (0..n_envs).map(|_| EnvData::new()).collect();
         Self {
             n_envs,
             reward_space,
+            use_sap_masking,
             env_data,
         }
     }
@@ -345,6 +351,7 @@ impl ParallelEnv {
                         &mut env_data.player_data.memories,
                         &obs,
                         &[Vec::new(), Vec::new()],
+                        self.use_sap_masking,
                         &env_data.player_data.known_params,
                     );
                 },
@@ -375,6 +382,7 @@ impl ParallelEnv {
                 &mut rng,
                 slice,
                 &actions,
+                self.use_sap_masking,
                 self.reward_space,
             );
         }
@@ -409,6 +417,7 @@ impl ParallelEnv {
                             rng,
                             slice,
                             &actions,
+                            self.use_sap_masking,
                             self.reward_space,
                         );
                     },
@@ -427,6 +436,7 @@ impl ParallelEnv {
         rng: &mut ThreadRng,
         mut env_slice: SingleEnvView,
         actions: &[Vec<Action>; P],
+        use_sap_masking: bool,
         reward_space: RewardSpace,
     ) {
         let (obs, result, stats) = step(
@@ -444,6 +454,7 @@ impl ParallelEnv {
             &mut env_data.player_data.memories,
             &obs,
             actions,
+            use_sap_masking,
             &env_data.player_data.known_params,
         );
         for (slice_reward, r) in env_slice

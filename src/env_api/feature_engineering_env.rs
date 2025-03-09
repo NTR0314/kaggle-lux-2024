@@ -38,13 +38,18 @@ type PyEnvOutputs<'py> = (
 #[pyclass]
 pub struct FeatureEngineeringEnv {
     player_data: PlayerData,
+    use_sap_masking: bool,
     team_id: usize,
 }
 
 #[pymethods]
 impl FeatureEngineeringEnv {
     #[new]
-    fn new(team_id: usize, env_params: Bound<'_, PyDict>) -> PyResult<Self> {
+    fn new(
+        team_id: usize,
+        use_sap_masking: bool,
+        env_params: Bound<'_, PyDict>,
+    ) -> PyResult<Self> {
         let env_params = env_params.as_any();
         let unit_move_cost =
             env_params.get_item("unit_move_cost")?.extract()?;
@@ -62,6 +67,7 @@ impl FeatureEngineeringEnv {
         let player_data = PlayerData::from_player_count_known_params(1, params);
         Ok(Self {
             team_id,
+            use_sap_masking,
             player_data,
         })
     }
@@ -101,6 +107,7 @@ impl FeatureEngineeringEnv {
             &mut self.player_data.memories,
             &[obs],
             &[last_actions],
+            self.use_sap_masking,
             &self.player_data.known_params,
         );
         out.into_pyarray_bound(py)

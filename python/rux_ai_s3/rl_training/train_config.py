@@ -13,3 +13,7 @@ class TrainConfig(BaseModel):
     @property
     def frame_stack_len(self) -> int:
         return self.env_config.frame_stack_len
+
+    @property
+    def use_sap_masking(self) -> bool:
+        return self.env_config.use_sap_masking

@@ -41,6 +41,7 @@ def main() -> None:
     env = ParallelEnv(
         n_envs=user_args.n_envs,
         frame_stack_len=FRAME_STACK_LEN,
+        use_sap_masking=True,
         reward_space=RewardSpace.FINAL_WINNER,
         jax_device=JAX_CPU,
     )

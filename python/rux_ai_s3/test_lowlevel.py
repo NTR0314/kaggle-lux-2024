@@ -35,7 +35,7 @@ def test_reward_space() -> None:
 class TestParallelEnv:
     @pytest.mark.slow
     def test_get_new_match_and_new_game_envs(self) -> None:
-        env = ParallelEnv(_N_ENVS, RewardSpace.FINAL_WINNER)
+        env = ParallelEnv(_N_ENVS, True, RewardSpace.FINAL_WINNER)
         new_map_dict = self.gen_map_vmapped()
         env.soft_reset(
             output_arrays=env.get_empty_outputs(),
@@ -98,7 +98,7 @@ class TestParallelEnv:
 
     @pytest.mark.slow
     def test_step(self) -> None:
-        env = ParallelEnv(_N_ENVS, RewardSpace.FINAL_WINNER)
+        env = ParallelEnv(_N_ENVS, True, RewardSpace.FINAL_WINNER)
         # Reset env
         new_map_dict = self.gen_map_vmapped()
         env_out = ParallelEnvOut.from_raw_validated(env.get_empty_outputs())
@@ -130,7 +130,7 @@ class TestParallelEnv:
 
     @pytest.mark.slow
     def test_soft_reset(self) -> None:
-        env = ParallelEnv(_N_ENVS, RewardSpace.FINAL_WINNER)
+        env = ParallelEnv(_N_ENVS, True, RewardSpace.FINAL_WINNER)
         env_out = ParallelEnvOut.from_raw_validated(env.get_empty_outputs())
         self.fill_env_out(env_out)
         new_map_dict = self.gen_map_vmapped()
@@ -254,7 +254,9 @@ class TestFeatureEngineeringEnv:
         team_id = 1
         lux_env = LuxAIS3GymEnv(numpy_output=True)
         lux_obs, info = lux_env.reset(seed=42)
-        fe_env = FeatureEngineeringEnv(team_id=team_id, env_params=info["params"])
+        fe_env = FeatureEngineeringEnv(
+            team_id=team_id, use_sap_masking=True, env_params=info["params"]
+        )
 
         actions = np.zeros((16, 3), dtype=int)
         fe_out = FeatureEngineeringOut.from_raw(

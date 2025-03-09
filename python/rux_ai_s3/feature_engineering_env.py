@@ -11,11 +11,13 @@ class FeatureEngineeringEnv:
         self,
         frame_stack_len: int,
         team_id: int,
+        use_sap_masking: bool,
         env_params: dict[str, Any],
     ) -> None:
         self.frame_stack_len = frame_stack_len
         self._env = LowLevelEnv(
             team_id=team_id,
+            use_sap_masking=use_sap_masking,
             env_params=env_params,
         )
         self._last_out: FeatureEngineeringOut = FeatureEngineeringOut.from_raw(

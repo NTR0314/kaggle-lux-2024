@@ -20,6 +20,7 @@ from .utils import GEN_MAP_MOCK_PARAMS
 class EnvConfig(BaseModel):
     n_envs: int
     frame_stack_len: int
+    use_sap_masking: bool
     reward_space: RewardSpace
     jax_device: str
 
@@ -65,6 +66,7 @@ class ParallelEnv:
         self,
         n_envs: int,
         frame_stack_len: int,
+        use_sap_masking: bool,
         reward_space: RewardSpace,
         jax_device: jax.Device,
     ) -> None:
@@ -89,7 +91,7 @@ class ParallelEnv:
                 )
             )
 
-        self._env = LowLevelEnv(n_envs, reward_space)
+        self._env = LowLevelEnv(n_envs, use_sap_masking, reward_space)
         self._last_out: ParallelEnvOut = self._make_empty_out()
         self._frame_history: deque[Obs] = self._make_empty_frame_history()
         self.hard_reset()
@@ -165,7 +167,8 @@ class ParallelEnv:
     def from_config(cls, config: EnvConfig) -> "ParallelEnv":
         return ParallelEnv(
             n_envs=config.n_envs,
-            reward_space=config.reward_space,
             frame_stack_len=config.frame_stack_len,
+            use_sap_masking=config.use_sap_masking,
+            reward_space=config.reward_space,
             jax_device=config.get_jax_device(),
         )
