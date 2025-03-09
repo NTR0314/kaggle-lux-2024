@@ -224,7 +224,7 @@ fn get_unit_frontier_sap_targets_map(
         .indexed_iter_mut()
         .filter(|(xy, _)| {
             opp_spawn.manhattan_distance(Pos::from(*xy))
-                <= obs.match_steps as usize + 1
+                < obs.match_steps as usize
         })
         .filter(|((x, y), _)| {
             // Don't sap known empty space
@@ -263,6 +263,7 @@ mod tests {
     use crate::rules_engine::state::Pos;
     use numpy::ndarray::{arr2, arr3, Array3};
     use pretty_assertions::assert_eq;
+    use rstest::rstest;
 
     #[test]
     fn test_sap_action_last() {
@@ -425,8 +426,56 @@ mod tests {
         assert_eq!(sap_targets_mask, expected_sap_targets_mask);
     }
 
-    #[test]
-    fn test_get_unit_frontier_sap_targets_map() {
-        todo!()
+    #[rstest]
+    #[case(
+        Observation {
+            sensor_mask: Array2::default([5, 5]),
+            match_steps: 0,
+            ..Default::default()
+        },
+        Array2::from_elem([5, 5], false),
+    )]
+    #[case(
+        Observation {
+            sensor_mask: Array2::default([5, 5]),
+            team_id: 0,
+            match_steps: 1,
+            ..Default::default()
+        },
+        arr2(&[
+            [false; 5],
+            [false; 5],
+            [false; 5],
+            [false; 5],
+            [false, false, false, false, true],
+        ]),
+    )]
+    #[case(
+        Observation {
+            sensor_mask: Array2::default([5, 5]),
+            team_id: 1,
+            match_steps: 3,
+            ..Default::default()
+        },
+        arr2(&[
+            [false; 5],
+            [false; 5],
+            [false, false, false, false, true],
+            [false, false, false, true, true],
+            [false, false, true, true, true],
+        ]),
+    )]
+    // TODO: More test cases
+    fn test_get_unit_frontier_sap_targets_map(
+        #[case] obs: Observation,
+        #[case] expected_sap_targets_mask: Array2<bool>,
+    ) {
+        assert_eq!(obs.sensor_mask.dim(), expected_sap_targets_mask.dim());
+
+        let (width, height) = expected_sap_targets_mask.dim();
+        let map_size = [width, height];
+        let sap_targets_mask =
+            get_unit_frontier_sap_targets_map(&obs, map_size);
+        assert_eq!(sap_targets_mask, expected_sap_targets_mask);
     }
 }
