@@ -14,6 +14,7 @@ from rux_ai_s3.lowlevel import (
     FeatureEngineeringEnv,
     ParallelEnv,
     RewardSpace,
+    SapMasking,
 )
 from rux_ai_s3.types import FeatureEngineeringOut, ParallelEnvOut
 from rux_ai_s3.utils import GEN_MAP_MOCK_PARAMS, to_json
@@ -24,12 +25,20 @@ _FLOAT_FLAG = -1_000
 _INT_FLAG = 1_000
 
 
-def test_reward_space() -> None:
+def test_reward_space_enum() -> None:
     for rs in RewardSpace.list():
         assert RewardSpace.from_str(str(rs)) == rs
 
     with pytest.raises(ValueError, match="Invalid RewardSpace"):
         RewardSpace.from_str("INVALID_REWARD_SPACE")
+
+
+def test_sap_masking_enum() -> None:
+    for mode in SapMasking.list():
+        assert SapMasking.from_str(str(mode)) == mode
+
+    with pytest.raises(ValueError, match="Invalid SapMasking"):
+        SapMasking.from_str("INVALID_SAP_MASKING")
 
 
 class TestParallelEnv:

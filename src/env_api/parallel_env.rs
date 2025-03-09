@@ -4,13 +4,13 @@ use crate::env_api::env_data::{
 use crate::env_api::utils::{
     action_array_to_vec, update_memories_and_write_output_arrays,
 };
+use crate::env_config::RewardSpace;
 use crate::feature_engineering::action_space::get_main_action_count;
 use crate::feature_engineering::obs_space::basic_obs_space::{
     get_nontemporal_global_feature_count,
     get_nontemporal_spatial_feature_count, get_temporal_global_feature_count,
     get_temporal_spatial_feature_count,
 };
-use crate::feature_engineering::reward_space::RewardSpace;
 use crate::izip_eq;
 use crate::rules_engine::action::Action;
 use crate::rules_engine::env::{get_energy_field, get_reset_observation, step};
