@@ -45,6 +45,6 @@ rl_model_config:
   n_blocks: 4
 
 device: cuda:0
-eval_games: 512
+eval_games: 256
 eval_device: cuda:1
 log_histograms: false
