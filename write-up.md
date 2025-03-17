@@ -129,6 +129,8 @@ Finally, the main actions were sampled independently for each unit, with the act
 For units which selected a sap action, the sap actor head used a 2-layer CNN to project the core output to shape 1x24x24, representing the non-normalized probability of sapping that square, and shared among all units.
 Illegal sap actions were masked out on a per-unit basis, taking into account that unit's location and sap range.
 
+![](https://raw.githubusercontent.com/IsaiahPressman/kaggle-lux-2024/main/media/model_architecture.svg)
+
 ### Reinforcement learning algorithm
 
 I used a relatively vanilla implementation of PPO with clipping, illegal action masking, and additional entropy and teacher-KL loss terms.
