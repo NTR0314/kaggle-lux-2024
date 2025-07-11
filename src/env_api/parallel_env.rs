@@ -460,7 +460,7 @@ impl ParallelEnv {
         for (slice_reward, r) in env_slice
             .reward
             .iter_mut()
-            .zip_eq(reward_space.get_reward(result))
+            .zip_eq(reward_space.get_reward(&env_data.state, result))
         {
             *slice_reward = r
         }

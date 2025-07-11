@@ -102,6 +102,13 @@ def build_critic_head(
             activation=activation,
         )
 
+    if reward_space == RewardSpace.CENTER:
+        return PositiveUnboundedCriticHead(
+            reward_min=0,
+            d_model=d_model,
+            activation=activation,
+        )
+
     assert_never(reward_space)
 
 
