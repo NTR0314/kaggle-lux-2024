@@ -30,6 +30,15 @@ build-release:
 build-agent:
 	maturin develop --release
 
+docker-build:
+	docker buildx build \
+		--build-arg USER_ID=$$(id -u) \
+		--build-arg GROUP_ID=$$(id -g) \
+		-f Dockerfile.train \
+		--target tmp \
+		-t ruxai \
+		.
+
 test: rs-test-full py-test-slow
 check: rs-lint py-lint py-static
 prepare: build rs-format py-format check test
