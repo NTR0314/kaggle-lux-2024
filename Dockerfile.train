@@ -9,6 +9,8 @@ RUN adduser --disabled-password --gecos '' --uid $USER_ID --gid $GROUP_ID docker
 
 RUN mkdir /home/rux_ai_s3
 COPY . /home/rux_ai_s3
+RUN chown -R docker_user:docker_user /home/rux_ai_s3
+RUN chmod -R 755 /home/rux_ai_s3
 RUN mkdir /home/rux_ai_s3/train_outputs
 WORKDIR /home/rux_ai_s3
 
@@ -38,14 +40,19 @@ RUN rye sync
 FROM stage3 as tmp
 USER root
 RUN pip uninstall -y numba
-USER docker_user
-USER root
-
-FROM tmp as stage4
+RUN pip uninstall -y cudf cugraph cugraph-dgl cugraph-pyg cugraph-service-server cuml dask-cuda librosa
+RUN pip uninstall -y dask-cudf raft-dask
+RUN pip uninstall -y cupy-cuda12x thinc nvidia-modelopt
+RUN sed -i '/numpy/d' /etc/pip/constraint.txt
+RUN sed -i '/torch>=2.5.1/d' pyproject.toml
+# AI:Fresh copy to avoid filesystem layer issues
+RUN cp -r /home/rux_ai_s3 /tmp/build_clean
+RUN chown -R docker_user:docker_user /tmp/build_clean
 USER docker_user
 RUN pip install --upgrade "numpy>=2.1.1"
-# Activate venv and run make prepare
-ENV PATH=/home/docker_user/.venv/bin/:$PATH
 
+FROM tmp as stage4
+WORKDIR /tmp/build_clean
+USER docker_user
+ENV PATH=/home/docker_user/.venv/bin:/home/docker_user/.cargo/bin:/home/docker_user/.rye/shims:$PATH
 RUN make build-release
-
