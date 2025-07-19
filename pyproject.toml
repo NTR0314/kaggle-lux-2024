@@ -8,7 +8,6 @@ authors = [
 dependencies = [
     "ruff>=0.6.8",
     "mypy>=1.11.2",
-    "pytest>=8.3.3",
     "numpy>=2.1.1",
     "pip>=24.2",
     "luxai-s3 @ git+https://github.com/Lux-AI-Challenge/Lux-Design-S3#subdirectory=src",

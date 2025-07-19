@@ -30,6 +30,24 @@ build-release:
 build-agent:
 	maturin develop --release
 
+docker-build:
+	docker buildx build \
+		--build-arg USER_ID=$$(id -u) \
+		--build-arg GROUP_ID=$$(id -g) \
+		-f Dockerfile.train \
+		-t ruxai \
+		.
+
+docker-run:
+	docker run \
+		--mount type=bind,source=/home/oswald/kaggle-lux-2024/train_outputs,target=/home/rux_ai_s3/train_outputs \
+		--gpus all \
+		--ipc=host \
+		--ulimit memlock=-1 \
+		--ulimit stack=67108864 \
+		--rm \
+		-it ruxai
+
 test: rs-test-full py-test-slow
 check: rs-lint py-lint py-static
 prepare: build rs-format py-format check test
