@@ -38,7 +38,7 @@ docker-build:
 		-t ruxai \
 		.
 
-docker-run:
+docker-run-old:
 	docker run \
 		--mount type=bind,source=/home/oswald/kaggle-lux-2024/train_outputs,target=/home/rux_ai_s3/train_outputs \
 		--gpus all \
@@ -46,6 +46,18 @@ docker-run:
 		--ulimit memlock=-1 \
 		--ulimit stack=67108864 \
 		--rm \
+		-it ruxai
+
+docker-run:
+	docker run \
+		--mount type=bind,source=$$(pwd),target=/workspace \
+		--mount type=bind,source=/home/oswald/kaggle-lux-2024/train_outputs,target=/workspace/train_outputs \
+		--gpus all \
+		--ipc=host \
+		--ulimit memlock=-1 \
+		--ulimit stack=67108864 \
+		--rm \
+		--user root \
 		-it ruxai
 
 test: rs-test-full py-test-slow

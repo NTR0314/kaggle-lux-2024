@@ -1,0 +1,58 @@
+FROM nvcr.io/nvidia/pytorch:25.04-py3 AS stage1
+
+# For setting user 
+ARG USER_ID
+ARG GROUP_ID
+RUN echo "USER_ID=$USER_ID, GROUP_ID=$GROUP_ID"
+RUN addgroup --gid $GROUP_ID docker_user
+RUN adduser --disabled-password --gecos '' --uid $USER_ID --gid $GROUP_ID docker_user
+
+RUN mkdir /home/rux_ai_s3
+COPY . /home/rux_ai_s3
+RUN chown -R docker_user:docker_user /home/rux_ai_s3
+RUN chmod -R 755 /home/rux_ai_s3
+RUN mkdir /home/rux_ai_s3/train_outputs
+WORKDIR /home/rux_ai_s3
+
+USER root
+RUN chown -R docker_user /home/rux_ai_s3
+USER docker_user
+# Install rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH=/home/docker_user/.cargo/bin:$PATH
+
+FROM stage1 as stage2
+USER docker_user
+# Update rust nightly
+RUN rustup update nightly
+RUN rustup component add rustfmt --toolchain nightly
+# Install rye
+ENV PATH=/home/docker_user/.rye/shims:$PATH
+RUN curl -sSf https://rye.astral.sh/get | RYE_VERSION="0.41.0" RYE_INSTALL_OPTION="--yes" bash
+# Install maturin
+RUN rye install maturin
+
+FROM stage2 as stage3
+USER docker_user
+# Install packages
+RUN rye sync
+
+FROM stage3 as tmp
+USER root
+RUN pip uninstall -y numba
+RUN pip uninstall -y cudf cugraph cugraph-dgl cugraph-pyg cugraph-service-server cuml dask-cuda librosa
+RUN pip uninstall -y dask-cudf raft-dask
+RUN pip uninstall -y cupy-cuda12x thinc nvidia-modelopt
+RUN sed -i '/numpy/d' /etc/pip/constraint.txt
+RUN sed -i '/torch>=2.5.1/d' pyproject.toml
+# AI:Fresh copy to avoid filesystem layer issues
+RUN cp -r /home/rux_ai_s3 /tmp/build_clean
+RUN chown -R docker_user:docker_user /tmp/build_clean
+USER docker_user
+RUN pip install --upgrade "numpy>=2.1.1"
+
+FROM tmp as stage4
+WORKDIR /tmp/build_clean
+USER docker_user
+ENV PATH=/home/docker_user/.venv/bin:/home/docker_user/.cargo/bin:/home/docker_user/.rye/shims:$PATH
+RUN make build-release
