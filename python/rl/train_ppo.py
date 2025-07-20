@@ -665,7 +665,8 @@ def train_step(
     scalar_stats["game_steps"] = train_state.step * cfg.game_steps_per_update
     assert experience.reward.shape[-1] == 2
     nonzero_reward = experience.reward[experience.reward != 0.0]
-    if len(nonzero_reward) > 0:
+    if len(nonzero_reward) > 0 and len(nonzero_reward) % 2 == 0:
+        # debug nonzero_reward shape
         nonzero_reward = nonzero_reward.reshape(-1, 2)
         scalar_stats["mean_nonzero_reward"] = nonzero_reward.mean().item()
         scalar_stats["p1_mean_nonzero_reward"] = nonzero_reward[..., 0].mean().item()
