@@ -102,7 +102,14 @@ def build_critic_head(
             activation=activation,
         )
 
-    if reward_space == RewardSpace.CENTER:
+    if reward_space == RewardSpace.CENTER_REWARD:
+        return PositiveUnboundedCriticHead(
+            reward_min=0,
+            d_model=d_model,
+            activation=activation,
+        )
+        
+    if reward_space == RewardSpace.ENERGY_REWARD:
         return PositiveUnboundedCriticHead(
             reward_min=0,
             d_model=d_model,
