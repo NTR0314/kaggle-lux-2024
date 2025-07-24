@@ -490,6 +490,58 @@ def main() -> None:  # noqa: C901
     eval_model = (
         build_model(env, cfg.rl_model_config).to(cfg.eval_device).eval().share_memory()
     )
+    
+    # [OSWALD]: BENCHING
+    from torch.profiler import profile, record_function, ProfilerActivity
+    def profile_model(model, staked_obs, action_info, num_iters=100):
+        # Warm up (critical for accurate results!)
+        for _ in range(10):
+            model_out = model(
+                obs=stacked_obs.flatten(start_dim=0, end_dim=1),
+                action_info=action_info.flatten(start_dim=0, end_dim=1),
+            )
+        torch.cuda.synchronize()
+
+        # Profile
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            with_flops=True,
+            with_modules=True,  # Shows time per module
+        ) as prof:
+            with record_function("model_inference"):
+                for _ in range(num_iters):
+                    model_out = model(
+                        obs=stacked_obs.flatten(start_dim=0, end_dim=1),
+                        action_info=action_info.flatten(start_dim=0, end_dim=1),
+                    )
+                    torch.cuda.synchronize()  # Important for accurate GPU timing
+
+        # Print results
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
+
+        # Export for visualization
+        prof.export_chrome_trace("trace.json")
+
+        # Get specific module timings
+        for key in prof.key_averages():
+            if key.key.startswith("[nn.Module]"):
+                print(f"{key.key}: {key.cuda_time_total / 1000:.2f} ms")
+
+        return prof
+    
+    last_out = env.last_out
+    stacked_obs = TorchObs.from_numpy(env.get_frame_stacked_obs(), cfg.device)
+    action_info = TorchActionInfo.from_numpy(last_out.action_info, cfg.device)
+    with torch.autocast(
+        device_type="cuda", dtype=torch.float16, enabled=cfg.use_mixed_precision
+    ):
+    prof = profile_model(model, stacked_obs, action_info)
+    exit()
+
+
     if args.model_weights:
         load_model_weights(
             model,
