@@ -29,3 +29,8 @@ python/rux_ai_s3/*.cpython*
 
 # venv
 .venv
+
+# OSWALD:
+# replays
+replays/
+.vscode/
